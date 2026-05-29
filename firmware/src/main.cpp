@@ -110,6 +110,7 @@ static bool parse_json(const char* json, UsageData* out) {
     out->weekly_reset_mins = doc["wr"] | -1;
     strlcpy(out->status, doc["st"] | "unknown", sizeof(out->status));
     out->ok = doc["ok"] | false;
+    out->active = doc["active"] | false;
     out->valid = true;
     return true;
 }

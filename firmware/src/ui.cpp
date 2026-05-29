@@ -133,6 +133,7 @@ static uint8_t anim_spinner_idx = 0;
 static uint8_t anim_phase = 0;
 static uint8_t anim_msg_idx = 0;
 static uint32_t anim_msg_start = 0;
+static bool s_active = false;
 #define ANIM_MSG_MS     4000
 
 static const char* const spinner_frames[] = {
@@ -448,6 +449,7 @@ void ui_init(void) {
 
 void ui_update(const UsageData* data) {
     if (!data->valid) return;
+    s_active = data->active;
 
     int s_pct = (int)(data->session_pct + 0.5f);
 
@@ -470,6 +472,11 @@ void ui_update(const UsageData* data) {
 
 void ui_tick_anim(void) {
     if (current_screen != SCREEN_USAGE) return;
+
+    if (!s_active) {
+        lv_label_set_text(lbl_anim, "IDLE");
+        return;
+    }
 
     uint32_t now = lv_tick_get();
 

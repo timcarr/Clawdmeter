@@ -8,5 +8,6 @@ struct UsageData {
     int weekly_reset_mins;   // minutes until weekly resets
     char status[16];         // "allowed" or "limited"
     bool ok;                 // data parse succeeded
+    bool active;             // true if session utilization rose recently
     bool valid;              // false until first successful parse
 };

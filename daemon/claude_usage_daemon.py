@@ -21,13 +21,29 @@ import httpx
 from bleak import BleakClient, BleakScanner
 from bleak.exc import BleakError
 
+import logging
+
+_log_path = Path(__file__).parent / "daemon.log"
+logging.basicConfig(
+    filename=str(_log_path),
+    level=logging.INFO,
+    format="%(message)s",
+)
+
+def log(msg):
+    ts = time.strftime("[%H:%M:%S]")
+    line = f"{ts} {msg}"
+    logging.info(line)
+    print(line, flush=True)
+    
 DEVICE_NAME = "Claude Controller"
 SERVICE_UUID = "4c41555a-4465-7669-6365-000000000001"
 RX_CHAR_UUID = "4c41555a-4465-7669-6365-000000000002"
 REQ_CHAR_UUID = "4c41555a-4465-7669-6365-000000000004"
 
-POLL_INTERVAL = 60
+POLL_INTERVAL = 10  # was 60
 TICK = 5
+ACTIVE_DECAY_SECS = 5 * 60
 SCAN_TIMEOUT = 8.0
 
 # macOS: token lives in Keychain (service "Claude Code-credentials").
@@ -50,8 +66,8 @@ API_BODY = {
 }
 
 
-def log(msg: str) -> None:
-    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+#def log(msg: str) -> None:
+#    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
 def _extract_access_token(blob: str) -> str | None:
@@ -250,6 +266,8 @@ async def connect_and_run(address: str, stop_event: asyncio.Event) -> bool:
     await session.setup_refresh_subscription()
 
     last_poll = 0.0
+    last_session_pct = -1.0
+    last_active_ts = 0.0
     used_successfully = False
     try:
         while client.is_connected and not stop_event.is_set():
@@ -263,6 +281,12 @@ async def connect_and_run(address: str, stop_event: asyncio.Event) -> bool:
                 else:
                     payload = await poll_api(token)
                     if payload is not None:
+                        new_s = payload["s"]
+                        ts = time.time()
+                        if last_session_pct >= 0 and new_s > last_session_pct:
+                            last_active_ts = ts
+                        last_session_pct = new_s
+                        payload["active"] = (ts - last_active_ts) < ACTIVE_DECAY_SECS
                         if await session.write_payload(payload):
                             last_poll = time.time()
                             used_successfully = True
