@@ -134,6 +134,7 @@ static uint8_t anim_phase = 0;
 static uint8_t anim_msg_idx = 0;
 static uint32_t anim_msg_start = 0;
 static bool s_active = false;
+static bool s_connected = false;
 #define ANIM_MSG_MS     4000
 
 static const char* const spinner_frames[] = {
@@ -447,6 +448,17 @@ void ui_init(void) {
     lv_obj_set_pos(battery_img, L.scr_w - 48 - L.margin, L.title_y);
 }
 
+static void reset_usage_panels(void) {
+    lv_label_set_text(lbl_session_pct, "---%");
+    lv_bar_set_value(bar_session, 0, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(bar_session, COL_GREEN, LV_PART_INDICATOR);
+    lv_label_set_text(lbl_session_reset, "---");
+    lv_label_set_text(lbl_weekly_pct, "---%");
+    lv_bar_set_value(bar_weekly, 0, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(bar_weekly, COL_GREEN, LV_PART_INDICATOR);
+    lv_label_set_text(lbl_weekly_reset, "---");
+}
+
 void ui_update(const UsageData* data) {
     if (!data->valid) return;
     s_active = data->active;
@@ -472,6 +484,11 @@ void ui_update(const UsageData* data) {
 
 void ui_tick_anim(void) {
     if (current_screen != SCREEN_USAGE) return;
+
+    if (!s_connected) {
+        lv_label_set_text(lbl_anim, "DISCONNECTED");
+        return;
+    }
 
     if (!s_active) {
         lv_label_set_text(lbl_anim, "IDLE");
@@ -559,6 +576,13 @@ screen_t ui_get_current_screen(void) {
 }
 
 void ui_update_ble_status(ble_state_t state, const char* name, const char* mac) {
+    bool now_connected = (state == BLE_STATE_CONNECTED);
+    if (!now_connected && s_connected) {
+        s_active = false;
+        reset_usage_panels();
+    }
+    s_connected = now_connected;
+
     switch (state) {
     case BLE_STATE_CONNECTED:
         lv_label_set_text(lbl_ble_status, "Connected");
