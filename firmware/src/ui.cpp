@@ -35,6 +35,7 @@ struct Layout {
 
     // Bluetooth screen
     int16_t bt_info_panel_h;
+    int16_t bt_host_y;
     int16_t bt_reset_zone_h;
     const lv_font_t* bt_title_font;
     const lv_font_t* bt_status_font;
@@ -61,7 +62,8 @@ static void compute_layout(const BoardCaps& c) {
         L.usage_panel_gap = 16;
         L.usage_bar_y = 56;
         L.usage_reset_y = 94;
-        L.bt_info_panel_h = 160;
+        L.bt_info_panel_h = 188;
+        L.bt_host_y = 132;
         L.bt_reset_zone_h = 110;
         L.bt_title_font    = &font_tiempos_56;
         L.bt_status_font   = &font_styrene_48;
@@ -75,7 +77,8 @@ static void compute_layout(const BoardCaps& c) {
         L.usage_panel_gap = 12;
         L.usage_bar_y = 48;
         L.usage_reset_y = 78;
-        L.bt_info_panel_h = 140;
+        L.bt_info_panel_h = 172;
+        L.bt_host_y = 124;
         L.bt_reset_zone_h = 90;
         L.bt_title_font    = &font_tiempos_34;
         L.bt_status_font   = &font_styrene_28;
@@ -117,6 +120,7 @@ static lv_obj_t* ble_container;
 static lv_obj_t* lbl_ble_status;
 static lv_obj_t* lbl_ble_device;
 static lv_obj_t* lbl_ble_mac;
+static lv_obj_t* lbl_ble_host;
 
 // ---- Battery indicator (shared, on top) ----
 static lv_obj_t* battery_img;
@@ -380,6 +384,12 @@ static void init_bluetooth_screen(lv_obj_t* scr) {
     lv_obj_set_style_text_color(lbl_ble_mac, COL_DIM, 0);
     lv_obj_set_pos(lbl_ble_mac, 0, 100);
 
+    lbl_ble_host = lv_label_create(p_info);
+    lv_label_set_text(lbl_ble_host, "Connected to: ---");
+    lv_obj_set_style_text_font(lbl_ble_host, L.bt_device_font, 0);
+    lv_obj_set_style_text_color(lbl_ble_host, COL_DIM, 0);
+    lv_obj_set_pos(lbl_ble_host, 0, L.bt_host_y);
+
     int reset_y = L.content_y + L.bt_info_panel_h + 16;
     lv_obj_t* reset_zone = lv_obj_create(ble_container);
     lv_obj_set_pos(reset_zone, L.margin, reset_y);
@@ -457,6 +467,8 @@ static void reset_usage_panels(void) {
     lv_bar_set_value(bar_weekly, 0, LV_ANIM_OFF);
     lv_obj_set_style_bg_color(bar_weekly, COL_GREEN, LV_PART_INDICATOR);
     lv_label_set_text(lbl_weekly_reset, "---");
+    lv_label_set_text(lbl_ble_host, "Connected to: ---");
+    lv_obj_set_style_text_color(lbl_ble_host, COL_DIM, 0);
 }
 
 void ui_update(const UsageData* data) {
@@ -480,6 +492,13 @@ void ui_update(const UsageData* data) {
 
     format_reset_time(data->weekly_reset_mins, buf, sizeof(buf));
     lv_label_set_text(lbl_weekly_reset, buf);
+
+    if (data->host_name[0]) {
+        static char hbuf[80];
+        snprintf(hbuf, sizeof(hbuf), "Connected to: %s", data->host_name);
+        lv_label_set_text(lbl_ble_host, hbuf);
+        lv_obj_set_style_text_color(lbl_ble_host, COL_TEXT, 0);
+    }
 }
 
 void ui_tick_anim(void) {

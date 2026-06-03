@@ -12,6 +12,7 @@ import json
 import os
 import re
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -40,6 +41,8 @@ DEVICE_NAME = "Claude Controller"
 SERVICE_UUID = "4c41555a-4465-7669-6365-000000000001"
 RX_CHAR_UUID = "4c41555a-4465-7669-6365-000000000002"
 REQ_CHAR_UUID = "4c41555a-4465-7669-6365-000000000004"
+
+HOSTNAME = socket.gethostname()
 
 POLL_INTERVAL = 10  # was 60
 TICK = 5
@@ -212,6 +215,7 @@ async def poll_api(token: str) -> dict | None:
         "wr": reset_minutes(hdr("anthropic-ratelimit-unified-7d-reset")),
         "st": hdr("anthropic-ratelimit-unified-5h-status", "unknown"),
         "ok": True,
+        "host": HOSTNAME,
     }
     return payload
 
