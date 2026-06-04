@@ -221,16 +221,28 @@ poll() {
     s7d_reset=${s7d_reset:-0}
     status=${status:-unknown}
 
+    # Active when utilization rose more than ACTIVE_THRESHOLD since the last poll.
+    # Goes idle the moment the API stops reporting a rise — no artificial holdoff.
+    local active="false"
+    if [ -n "$_PREV_UTIL" ]; then
+        local delta
+        delta=$(echo "$s5h_util - $_PREV_UTIL" | bc -l)
+        if [ "$(echo "$delta > $ACTIVE_THRESHOLD" | bc -l)" = "1" ]; then
+            active="true"
+        fi
+    fi
+    _PREV_UTIL="$s5h_util"
+
     local host_name
     host_name=$(hostname)
     local payload
-    payload=$(awk -v u5="$s5h_util" -v r5="$s5h_reset" -v u7="$s7d_util" -v r7="$s7d_reset" -v st="$status" -v now="$now" -v host="$host_name" \
+    payload=$(awk -v u5="$s5h_util" -v r5="$s5h_reset" -v u7="$s7d_util" -v r7="$s7d_reset" -v st="$status" -v now="$now" -v host="$host_name" -v act="$active" \
         'BEGIN {
-            sp = sprintf("%.0f", u5 * 100);
+            sp = sprintf("%.3f", u5 * 100);
             sr = (r5 - now) / 60; sr = sr > 0 ? sprintf("%.0f", sr) : 0;
-            wp = sprintf("%.0f", u7 * 100);
+            wp = sprintf("%.3f", u7 * 100);
             wr = (r7 - now) / 60; wr = wr > 0 ? sprintf("%.0f", wr) : 0;
-            printf "{\"s\":%s,\"sr\":%s,\"w\":%s,\"wr\":%s,\"st\":\"%s\",\"ok\":true,\"host\":\"%s\"}", sp, sr, wp, wr, st, host;
+            printf "{\"s\":%s,\"sr\":%s,\"w\":%s,\"wr\":%s,\"st\":\"%s\",\"ok\":true,\"host\":\"%s\",\"active\":%s}", sp, sr, wp, wr, st, host, act;
         }')
 
     log "Sending: $payload"
@@ -249,7 +261,13 @@ trap cleanup INT TERM
 log "=== Claude Usage Tracker Daemon (BLE) ==="
 log "Poll interval: ${POLL_INTERVAL}s"
 
+# Minimum per-poll rise in 5h utilization to count as real usage.
+# Must be above the daemon's own dummy-call noise (~50 tokens / your 5h quota).
+# Raise this if the daemon's haiku calls alone keep triggering active.
+ACTIVE_THRESHOLD=0.001
+
 BACKOFF=1
+_PREV_UTIL=""  # raw float from last successful poll; empty until first poll
 
 while true; do
     # Find the device

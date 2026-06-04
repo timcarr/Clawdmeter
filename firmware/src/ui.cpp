@@ -477,7 +477,8 @@ void ui_update(const UsageData* data) {
 
     int s_pct = (int)(data->session_pct + 0.5f);
 
-    lv_label_set_text_fmt(lbl_session_pct, "%d%%", s_pct);
+    char spct[16]; snprintf(spct, sizeof(spct), "%.1f%%", data->session_pct);
+    lv_label_set_text(lbl_session_pct, spct);
     lv_bar_set_value(bar_session, s_pct, LV_ANIM_ON);
     lv_obj_set_style_bg_color(bar_session, pct_color(data->session_pct), LV_PART_INDICATOR);
 
@@ -486,7 +487,8 @@ void ui_update(const UsageData* data) {
     lv_label_set_text(lbl_session_reset, buf);
 
     int w_pct = (int)(data->weekly_pct + 0.5f);
-    lv_label_set_text_fmt(lbl_weekly_pct, "%d%%", w_pct);
+    char wpct[16]; snprintf(wpct, sizeof(wpct), "%.1f%%", data->weekly_pct);
+    lv_label_set_text(lbl_weekly_pct, wpct);
     lv_bar_set_value(bar_weekly, w_pct, LV_ANIM_ON);
     lv_obj_set_style_bg_color(bar_weekly, pct_color(data->weekly_pct), LV_PART_INDICATOR);
 
