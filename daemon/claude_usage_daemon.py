@@ -296,7 +296,7 @@ async def connect_and_run(address: str, stop_event: asyncio.Event) -> bool:
                     payload = await poll_api(token)
                     if payload is not None:
                         raw_util = payload.pop("_raw_util", 0.0)
-active = (last_raw_util >= 0 and raw_util - last_raw_util > ACTIVE_THRESHOLD)
+                        active = (last_raw_util >= 0 and raw_util - last_raw_util > ACTIVE_THRESHOLD)
                         last_raw_util = raw_util
                         payload["active"] = active
                         if await session.write_payload(payload):
