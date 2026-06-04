@@ -46,8 +46,12 @@ HOSTNAME = socket.gethostname()
 
 POLL_INTERVAL = 10  # was 60
 TICK = 5
-ACTIVE_DECAY_SECS = 5 * 60
 SCAN_TIMEOUT = 8.0
+
+# Minimum per-poll rise in 5h utilization (0–1) to count as real usage.
+# Must be above the daemon's own dummy-call noise (~50 tokens / your 5h quota).
+# Raise if the daemon's haiku calls alone keep triggering active.
+ACTIVE_THRESHOLD = 0.001
 
 # macOS: token lives in Keychain (service "Claude Code-credentials").
 # Linux: token lives in ~/.claude/.credentials.json.
@@ -208,6 +212,12 @@ async def poll_api(token: str) -> dict | None:
         except ValueError:
             return 0
 
+    def raw(util: str) -> float:
+        try:
+            return float(util)
+        except ValueError:
+            return 0.0
+
     payload = {
         "s": pct(hdr("anthropic-ratelimit-unified-5h-utilization")),
         "sr": reset_minutes(hdr("anthropic-ratelimit-unified-5h-reset")),
@@ -216,6 +226,7 @@ async def poll_api(token: str) -> dict | None:
         "st": hdr("anthropic-ratelimit-unified-5h-status", "unknown"),
         "ok": True,
         "host": HOSTNAME,
+        "_raw_util": raw(hdr("anthropic-ratelimit-unified-5h-utilization")),
     }
     return payload
 
@@ -270,8 +281,7 @@ async def connect_and_run(address: str, stop_event: asyncio.Event) -> bool:
     await session.setup_refresh_subscription()
 
     last_poll = 0.0
-    last_session_pct = -1.0
-    last_active_ts = 0.0
+    last_raw_util = -1.0
     used_successfully = False
     try:
         while client.is_connected and not stop_event.is_set():
@@ -285,12 +295,10 @@ async def connect_and_run(address: str, stop_event: asyncio.Event) -> bool:
                 else:
                     payload = await poll_api(token)
                     if payload is not None:
-                        new_s = payload["s"]
-                        ts = time.time()
-                        if last_session_pct >= 0 and new_s > last_session_pct:
-                            last_active_ts = ts
-                        last_session_pct = new_s
-                        payload["active"] = (ts - last_active_ts) < ACTIVE_DECAY_SECS
+                        raw_util = payload.pop("_raw_util", 0.0)
+active = (last_raw_util >= 0 and raw_util - last_raw_util > ACTIVE_THRESHOLD)
+                        last_raw_util = raw_util
+                        payload["active"] = active
                         if await session.write_payload(payload):
                             last_poll = time.time()
                             used_successfully = True
