@@ -139,6 +139,9 @@ static uint8_t anim_msg_idx = 0;
 static uint32_t anim_msg_start = 0;
 static bool s_active = false;
 static bool s_connected = false;
+static uint32_t last_update_ms = 0;
+static bool has_received_update = false;
+static uint32_t last_idle_secs_shown = UINT32_MAX;
 #define ANIM_MSG_MS     4000
 
 static const char* const spinner_frames[] = {
@@ -474,6 +477,8 @@ static void reset_usage_panels(void) {
 void ui_update(const UsageData* data) {
     if (!data->valid) return;
     s_active = data->active;
+    last_update_ms = lv_tick_get();
+    has_received_update = true;
 
     int s_pct = (int)(data->session_pct + 0.5f);
 
@@ -504,17 +509,37 @@ void ui_update(const UsageData* data) {
 void ui_tick_anim(void) {
     if (current_screen != SCREEN_USAGE) return;
 
+    uint32_t now = lv_tick_get();
+
     if (!s_connected) {
-        lv_label_set_text(lbl_anim, "DISCONNECTED");
+        if (has_received_update) {
+            uint32_t secs = (now - last_update_ms) / 1000;
+            if (secs != last_idle_secs_shown) {
+                last_idle_secs_shown = secs;
+                static char buf[40];
+                snprintf(buf, sizeof(buf), "DISCONNECTED  %lus", (unsigned long)secs);
+                lv_label_set_text(lbl_anim, buf);
+            }
+        } else {
+            lv_label_set_text(lbl_anim, "DISCONNECTED");
+        }
         return;
     }
 
     if (!s_active) {
-        lv_label_set_text(lbl_anim, "IDLE");
+        if (has_received_update) {
+            uint32_t secs = (now - last_update_ms) / 1000;
+            if (secs != last_idle_secs_shown) {
+                last_idle_secs_shown = secs;
+                static char buf[32];
+                snprintf(buf, sizeof(buf), "IDLE  %lus", (unsigned long)secs);
+                lv_label_set_text(lbl_anim, buf);
+            }
+        } else {
+            lv_label_set_text(lbl_anim, "IDLE");
+        }
         return;
     }
-
-    uint32_t now = lv_tick_get();
 
     if (now - anim_msg_start >= ANIM_MSG_MS) {
         anim_msg_idx = (anim_msg_idx + 1) % ANIM_MSG_COUNT;
@@ -528,9 +553,11 @@ void ui_tick_anim(void) {
                                                         : (SPINNER_PHASES - anim_phase);
 
         static char buf[80];
-        snprintf(buf, sizeof(buf), "%s %s\xE2\x80\xA6",
+        uint32_t secs = has_received_update ? (now - last_update_ms) / 1000 : 0;
+        snprintf(buf, sizeof(buf), "%s %s\xE2\x80\xA6  %lus",
                  spinner_frames[anim_spinner_idx],
-                 anim_messages[anim_msg_idx]);
+                 anim_messages[anim_msg_idx],
+                 (unsigned long)secs);
         lv_label_set_text(lbl_anim, buf);
     }
 }
