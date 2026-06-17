@@ -72,8 +72,8 @@ static void compute_layout(const BoardCaps& c) {
         L.bt_credit_2_font = &font_styrene_20;
     } else {
         // Compact layout — tuned for 368x448 (AMOLED-1.8).
-        L.content_y = 85;
-        L.usage_panel_h = 130;
+        L.content_y = 92;
+        L.usage_panel_h = 120;
         L.usage_panel_gap = 12;
         L.usage_bar_y = 48;
         L.usage_reset_y = 78;
@@ -116,6 +116,7 @@ static lv_obj_t* lbl_weekly_pct;
 static lv_obj_t* lbl_weekly_label;
 static lv_obj_t* lbl_weekly_reset;
 static lv_obj_t* lbl_anim;      // status line: connection state + whimsical idle
+static lv_obj_t* lbl_host;     // small dim hostname label above usage panels
 
 // ---- Battery indicator (shared, on top) ----
 static lv_obj_t* battery_img;
@@ -130,13 +131,14 @@ static lv_obj_t* idle_group;            // the "Zzz" idle screen
 static uint32_t  last_data_ms = 0;      // lv_tick when the last valid usage update landed
 static bool      data_received = false; // any valid update since boot
 static int       view_state = -1;       // -1 unknown / 0 pair / 1 idle / 2 usage
-static const uint32_t DATA_FRESH_MS = 90000;  // usage counts as "live" within this window (daemon sends ~60s)
+static const uint32_t DATA_FRESH_MS = 30000;  // usage counts as "live" within this window (daemon sends ~20s)
 
 // ---- Shared ----
 static lv_image_dsc_t logo_dsc;
 static screen_t current_screen = SCREEN_USAGE;
 static bool     s_ble_connected = false;   // cached BLE connection state
 static uint32_t connected_at_ms = 0;       // when we last entered CONNECTED ("Connected" dwell)
+static char     s_hostname[64]  = {0};     // last known PC hostname; persists across reconnects
 
 // Animation state
 static uint32_t anim_last_ms = 0;
@@ -300,7 +302,7 @@ static void make_usage_panel(lv_obj_t* parent, int y, const char* pill_text,
 
     *out_reset = lv_label_create(panel);
     lv_label_set_text(*out_reset, "---");
-    lv_obj_set_style_text_font(*out_reset, &font_styrene_28, 0);
+    lv_obj_set_style_text_font(*out_reset, &font_styrene_20, 0);
     lv_obj_set_style_text_color(*out_reset, COL_DIM, 0);
     lv_obj_set_pos(*out_reset, 0, L.usage_reset_y);
 }
@@ -398,6 +400,13 @@ static void init_usage_screen(lv_obj_t* scr) {
     build_pair_group(usage_container);
     build_idle_group(usage_container);
 
+    // Hostname — sits between Weekly panel and the bottom status line.
+    lbl_host = lv_label_create(usage_container);
+    lv_label_set_text(lbl_host, "");
+    lv_obj_set_style_text_font(lbl_host, &font_styrene_16, 0);
+    lv_obj_set_style_text_color(lbl_host, COL_DIM, 0);
+    lv_obj_align(lbl_host, LV_ALIGN_BOTTOM_MID, 0, -60);
+
     // Status line — always visible on the usage view. Driven by ui_tick_anim().
     lbl_anim = lv_label_create(usage_container);
     lv_label_set_text(lbl_anim, "");
@@ -462,6 +471,13 @@ void ui_update(const UsageData* data) {
     format_reset_time(data->weekly_reset_mins, buf, sizeof(buf));
     lv_label_set_text(lbl_weekly_reset, buf);
 
+    if (data->host_name[0]) {
+        strncpy(s_hostname, data->host_name, sizeof(s_hostname) - 1);
+        s_hostname[sizeof(s_hostname) - 1] = '\0';
+        static char hbuf[80];
+        snprintf(hbuf, sizeof(hbuf), "Connected to: %s", s_hostname);
+        lv_label_set_text(lbl_host, hbuf);
+    }
 }
 
 // Pick the usage-view sub-screen: pairing hint (BLE down), the idle "Zzz" screen
@@ -575,8 +591,20 @@ void ui_update_ble_status(ble_state_t state, const char* name, const char* mac) 
     (void)name; (void)mac;
     bool was_connected = s_ble_connected;
     s_ble_connected = (state == BLE_STATE_CONNECTED);
-    if (!s_ble_connected && was_connected) s_active = false;
-    if (s_ble_connected && !was_connected) connected_at_ms = lv_tick_get();
+    if (!s_ble_connected && was_connected) {
+        s_active = false;
+        lv_label_set_text(lbl_host, "");
+    }
+    if (s_ble_connected && !was_connected) {
+        connected_at_ms = lv_tick_get();
+        if (s_hostname[0]) {
+            static char hbuf[80];
+            snprintf(hbuf, sizeof(hbuf), "Connected to: %s", s_hostname);
+            lv_label_set_text(lbl_host, hbuf);
+        } else {
+            lv_label_set_text(lbl_host, "Connected");
+        }
+    }
     update_view_state();
 }
 
