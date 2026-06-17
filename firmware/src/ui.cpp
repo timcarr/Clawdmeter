@@ -102,9 +102,11 @@ static void compute_layout(const BoardCaps& c) {
 #define COL_RED       THEME_RED
 #define COL_BAR_BG    THEME_BAR_BG
 
-// ---- Usage screen widgets ----
+// ---- Usage screen widgets (single non-splash view) ----
 static lv_obj_t* usage_container;
 static lv_obj_t* lbl_title;
+static lv_obj_t* usage_group;   // the two usage panels — shown when connected
+static lv_obj_t* pair_group;    // pairing hint — shown when disconnected
 static lv_obj_t* bar_session;
 static lv_obj_t* lbl_session_pct;
 static lv_obj_t* lbl_session_label;
@@ -113,23 +115,28 @@ static lv_obj_t* bar_weekly;
 static lv_obj_t* lbl_weekly_pct;
 static lv_obj_t* lbl_weekly_label;
 static lv_obj_t* lbl_weekly_reset;
-static lv_obj_t* lbl_anim;
-
-// ---- Bluetooth screen widgets ----
-static lv_obj_t* ble_container;
-static lv_obj_t* lbl_ble_status;
-static lv_obj_t* lbl_ble_device;
-static lv_obj_t* lbl_ble_mac;
-static lv_obj_t* lbl_ble_host;
+static lv_obj_t* lbl_anim;      // status line: connection state + whimsical idle
 
 // ---- Battery indicator (shared, on top) ----
 static lv_obj_t* battery_img;
 static lv_obj_t* logo_img;
 static lv_image_dsc_t battery_dscs[5];  // empty, low, medium, full, charging
 
+// ---- Live-data freshness → which usage sub-view to show ----
+// usage panels when data is flowing, an idle "Zzz" screen when the host is
+// connected but no usage update landed within DATA_FRESH_MS, the pairing hint
+// when BLE is down. Re-evaluated every loop in ui_tick_anim().
+static lv_obj_t* idle_group;            // the "Zzz" idle screen
+static uint32_t  last_data_ms = 0;      // lv_tick when the last valid usage update landed
+static bool      data_received = false; // any valid update since boot
+static int       view_state = -1;       // -1 unknown / 0 pair / 1 idle / 2 usage
+static const uint32_t DATA_FRESH_MS = 90000;  // usage counts as "live" within this window (daemon sends ~60s)
+
 // ---- Shared ----
 static lv_image_dsc_t logo_dsc;
 static screen_t current_screen = SCREEN_USAGE;
+static bool     s_ble_connected = false;   // cached BLE connection state
+static uint32_t connected_at_ms = 0;       // when we last entered CONNECTED ("Connected" dwell)
 
 // Animation state
 static uint32_t anim_last_ms = 0;
@@ -138,10 +145,8 @@ static uint8_t anim_phase = 0;
 static uint8_t anim_msg_idx = 0;
 static uint32_t anim_msg_start = 0;
 static bool s_active = false;
-static bool s_connected = false;
 static uint32_t last_update_ms = 0;
 static bool has_received_update = false;
-static uint32_t last_idle_secs_shown = UINT32_MAX;
 #define ANIM_MSG_MS     4000
 
 static const char* const spinner_frames[] = {
@@ -210,7 +215,6 @@ static void format_reset_time(int mins, char* buf, size_t len) {
 
 // Forward decls — callbacks defined near ui_show_screen below
 static void global_click_cb(lv_event_t* e);
-static void ble_reset_click_cb(lv_event_t* e);
 
 static lv_obj_t* make_panel(lv_obj_t* parent, int x, int y, int w, int h) {
     lv_obj_t* panel = lv_obj_create(parent);
@@ -242,15 +246,6 @@ static lv_obj_t* make_bar(lv_obj_t* parent, int x, int y, int w, int h) {
     lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_INDICATOR);
     lv_obj_set_style_radius(bar, 6, LV_PART_INDICATOR);
     return bar;
-}
-
-static void init_icon_dsc(lv_image_dsc_t* dsc, int w, int h, const uint16_t* data) {
-    dsc->header.w = w;
-    dsc->header.h = h;
-    dsc->header.cf = LV_COLOR_FORMAT_RGB565;
-    dsc->header.stride = w * 2;
-    dsc->data = (const uint8_t*)data;
-    dsc->data_size = w * h * 2;
 }
 
 static void init_icon_dsc_rgb565a8(lv_image_dsc_t* dsc, int w, int h, const uint8_t* data) {
@@ -310,6 +305,61 @@ static void make_usage_panel(lv_obj_t* parent, int y, const char* pill_text,
     lv_obj_set_pos(*out_reset, 0, L.usage_reset_y);
 }
 
+// Pairing hint — shown when disconnected so the screen isn't empty and the
+// user knows how to (re)pair. Wording matches the 3-second release gesture.
+static void build_pair_group(lv_obj_t* parent) {
+    pair_group = lv_obj_create(parent);
+    lv_obj_set_size(pair_group, L.scr_w, L.scr_h - L.content_y);
+    lv_obj_set_pos(pair_group, 0, L.content_y);
+    lv_obj_set_style_bg_opa(pair_group, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(pair_group, 0, 0);
+    lv_obj_set_style_pad_all(pair_group, 0, 0);
+    lv_obj_clear_flag(pair_group, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(pair_group, LV_OBJ_FLAG_EVENT_BUBBLE);
+
+    lv_obj_t* l1 = lv_label_create(pair_group);
+    lv_label_set_text(l1, "To pair");
+    lv_obj_set_style_text_font(l1, L.bt_status_font, 0);
+    lv_obj_set_style_text_color(l1, COL_TEXT, 0);
+    lv_obj_align(l1, LV_ALIGN_TOP_MID, 0, 40);
+
+    lv_obj_t* l2 = lv_label_create(pair_group);
+    lv_label_set_text(l2, "hold the power button");
+    lv_obj_set_style_text_font(l2, L.bt_device_font, 0);
+    lv_obj_set_style_text_color(l2, COL_DIM, 0);
+    lv_obj_align(l2, LV_ALIGN_TOP_MID, 0, 120);
+
+    lv_obj_t* l3 = lv_label_create(pair_group);
+    lv_label_set_text(l3, "for 3 seconds, then release");
+    lv_obj_set_style_text_font(l3, L.bt_device_font, 0);
+    lv_obj_set_style_text_color(l3, COL_DIM, 0);
+    lv_obj_align(l3, LV_ALIGN_TOP_MID, 0, 160);
+
+    lv_obj_add_flag(pair_group, LV_OBJ_FLAG_HIDDEN);  // ui_update_ble_status decides
+}
+
+// Idle "Zzz" screen — shown when the host is connected but no usage update has
+// landed recently (token expired, daemon down, host asleep…). Full-screen, like
+// the pairing hint, so we never render hours-old numbers as if they were live.
+static void build_idle_group(lv_obj_t* parent) {
+    idle_group = lv_obj_create(parent);
+    lv_obj_set_size(idle_group, L.scr_w, L.scr_h - L.content_y);
+    lv_obj_set_pos(idle_group, 0, L.content_y);
+    lv_obj_set_style_bg_opa(idle_group, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(idle_group, 0, 0);
+    lv_obj_set_style_pad_all(idle_group, 0, 0);
+    lv_obj_clear_flag(idle_group, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(idle_group, LV_OBJ_FLAG_EVENT_BUBBLE);
+
+    // A shrunk-down sleeping creature (reused claudepix "expression sleep" art)
+    // sits between the header and the status line; the animated "Listening…"
+    // status line carries the words, so no extra text is needed here.
+    lv_obj_t* creature = splash_mini_create(idle_group, "expression sleep", 160);
+    if (creature) lv_obj_align(creature, LV_ALIGN_CENTER, 0, -20);
+
+    lv_obj_add_flag(idle_group, LV_OBJ_FLAG_HIDDEN);  // update_view_state decides
+}
+
 static void init_usage_screen(lv_obj_t* scr) {
     usage_container = lv_obj_create(scr);
     lv_obj_set_size(usage_container, L.scr_w, L.scr_h);
@@ -326,110 +376,34 @@ static void init_usage_screen(lv_obj_t* scr) {
     lv_obj_set_style_text_color(lbl_title, COL_TEXT, 0);
     lv_obj_align(lbl_title, LV_ALIGN_TOP_MID, 16, L.title_y);
 
-    make_usage_panel(usage_container, L.content_y, "Current",
+    // Usage panels (shown when connected) live in a transparent full-size group
+    // so they can be toggled against the pairing hint as one unit.
+    usage_group = lv_obj_create(usage_container);
+    lv_obj_set_size(usage_group, L.scr_w, L.scr_h);
+    lv_obj_set_pos(usage_group, 0, 0);
+    lv_obj_set_style_bg_opa(usage_group, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(usage_group, 0, 0);
+    lv_obj_set_style_pad_all(usage_group, 0, 0);
+    lv_obj_clear_flag(usage_group, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(usage_group, LV_OBJ_FLAG_EVENT_BUBBLE);
+
+    make_usage_panel(usage_group, L.content_y, "Current",
                      &lbl_session_pct, &lbl_session_label,
                      &bar_session, &lbl_session_reset);
-    make_usage_panel(usage_container,
+    make_usage_panel(usage_group,
                      L.content_y + L.usage_panel_h + L.usage_panel_gap, "Weekly",
                      &lbl_weekly_pct, &lbl_weekly_label,
                      &bar_weekly, &lbl_weekly_reset);
 
+    build_pair_group(usage_container);
+    build_idle_group(usage_container);
+
+    // Status line — always visible on the usage view. Driven by ui_tick_anim().
     lbl_anim = lv_label_create(usage_container);
     lv_label_set_text(lbl_anim, "");
     lv_obj_set_style_text_font(lbl_anim, &font_mono_32, 0);
     lv_obj_set_style_text_color(lbl_anim, COL_ACCENT, 0);
     lv_obj_align(lbl_anim, LV_ALIGN_BOTTOM_MID, 0, -15);
-}
-
-// ======== Bluetooth Screen ========
-
-static void init_bluetooth_screen(lv_obj_t* scr) {
-    ble_container = lv_obj_create(scr);
-    lv_obj_set_size(ble_container, L.scr_w, L.scr_h);
-    lv_obj_set_pos(ble_container, 0, 0);
-    lv_obj_set_style_bg_opa(ble_container, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(ble_container, 0, 0);
-    lv_obj_set_style_pad_all(ble_container, 0, 0);
-    lv_obj_clear_flag(ble_container, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_event_cb(ble_container, global_click_cb, LV_EVENT_CLICKED, NULL);
-
-    lv_obj_t* lbl_ble_title = lv_label_create(ble_container);
-    lv_label_set_text(lbl_ble_title, "Bluetooth");
-    lv_obj_set_style_text_font(lbl_ble_title, L.bt_title_font, 0);
-    lv_obj_set_style_text_color(lbl_ble_title, COL_TEXT, 0);
-    lv_obj_align(lbl_ble_title, LV_ALIGN_TOP_MID, 16, L.title_y);
-
-    lv_obj_t* p_info = make_panel(ble_container, L.margin, L.content_y,
-                                  L.content_w, L.bt_info_panel_h);
-
-    static lv_image_dsc_t icon_bt_dsc;
-    init_icon_dsc(&icon_bt_dsc, ICON_BLUETOOTH_W, ICON_BLUETOOTH_H, icon_bluetooth_data);
-
-    lv_obj_t* bt_img = lv_image_create(p_info);
-    lv_image_set_src(bt_img, &icon_bt_dsc);
-    lv_obj_set_pos(bt_img, 0, 0);
-
-    lbl_ble_status = lv_label_create(p_info);
-    lv_label_set_text(lbl_ble_status, "Initializing...");
-    lv_obj_set_style_text_font(lbl_ble_status, L.bt_status_font, 0);
-    lv_obj_set_style_text_color(lbl_ble_status, COL_DIM, 0);
-    lv_obj_set_pos(lbl_ble_status, 56, 2);
-
-    lbl_ble_device = lv_label_create(p_info);
-    lv_label_set_text(lbl_ble_device, "Device: ---");
-    lv_obj_set_style_text_font(lbl_ble_device, L.bt_device_font, 0);
-    lv_obj_set_style_text_color(lbl_ble_device, COL_DIM, 0);
-    lv_obj_set_pos(lbl_ble_device, 0, 64);
-
-    lbl_ble_mac = lv_label_create(p_info);
-    lv_label_set_text(lbl_ble_mac, "Address: ---");
-    lv_obj_set_style_text_font(lbl_ble_mac, L.bt_device_font, 0);
-    lv_obj_set_style_text_color(lbl_ble_mac, COL_DIM, 0);
-    lv_obj_set_pos(lbl_ble_mac, 0, 100);
-
-    lbl_ble_host = lv_label_create(p_info);
-    lv_label_set_text(lbl_ble_host, "Connected to: ---");
-    lv_obj_set_style_text_font(lbl_ble_host, L.bt_device_font, 0);
-    lv_obj_set_style_text_color(lbl_ble_host, COL_DIM, 0);
-    lv_obj_set_pos(lbl_ble_host, 0, L.bt_host_y);
-
-    int reset_y = L.content_y + L.bt_info_panel_h + 16;
-    lv_obj_t* reset_zone = lv_obj_create(ble_container);
-    lv_obj_set_pos(reset_zone, L.margin, reset_y);
-    lv_obj_set_size(reset_zone, L.content_w, L.bt_reset_zone_h);
-    lv_obj_set_style_bg_color(reset_zone, COL_PANEL, 0);
-    lv_obj_set_style_bg_opa(reset_zone, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(reset_zone, 8, 0);
-    lv_obj_set_style_border_width(reset_zone, 0, 0);
-    lv_obj_set_style_pad_column(reset_zone, 14, 0);
-    lv_obj_set_flex_flow(reset_zone, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(reset_zone, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_clear_flag(reset_zone, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_event_cb(reset_zone, ble_reset_click_cb, LV_EVENT_CLICKED, NULL);
-
-    static lv_image_dsc_t icon_trash_dsc;
-    init_icon_dsc(&icon_trash_dsc, ICON_TRASH2_W, ICON_TRASH2_H, icon_trash2_data);
-    lv_obj_t* trash_img = lv_image_create(reset_zone);
-    lv_image_set_src(trash_img, &icon_trash_dsc);
-
-    lv_obj_t* reset_lbl = lv_label_create(reset_zone);
-    lv_label_set_text(reset_lbl, "Reset Bluetooth");
-    lv_obj_set_style_text_font(reset_lbl, L.bt_device_font, 0);
-    lv_obj_set_style_text_color(reset_lbl, COL_DIM, 0);
-
-    lv_obj_t* lbl_credit = lv_label_create(ble_container);
-    lv_label_set_text(lbl_credit, "Built by @hermannbjorgvin");
-    lv_obj_set_style_text_font(lbl_credit, L.bt_credit_1_font, 0);
-    lv_obj_set_style_text_color(lbl_credit, COL_DIM, 0);
-    lv_obj_align(lbl_credit, LV_ALIGN_BOTTOM_MID, 0, -46);
-
-    lv_obj_t* lbl_credit2 = lv_label_create(ble_container);
-    lv_label_set_text(lbl_credit2, "Clawd animation by @amaanbuilds");
-    lv_obj_set_style_text_font(lbl_credit2, L.bt_credit_2_font, 0);
-    lv_obj_set_style_text_color(lbl_credit2, COL_DIM, 0);
-    lv_obj_align(lbl_credit2, LV_ALIGN_BOTTOM_MID, 0, -20);
-
-    lv_obj_add_flag(ble_container, LV_OBJ_FLAG_HIDDEN);
 }
 
 // ======== Public API ========
@@ -445,7 +419,6 @@ void ui_init(void) {
     init_battery_icons();
 
     init_usage_screen(scr);
-    init_bluetooth_screen(scr);
     splash_init(scr);
 
     if (splash_get_root()) {
@@ -459,26 +432,17 @@ void ui_init(void) {
     battery_img = lv_image_create(scr);
     lv_image_set_src(battery_img, &battery_dscs[0]);
     lv_obj_set_pos(battery_img, L.scr_w - 48 - L.margin, L.title_y);
+
 }
 
-static void reset_usage_panels(void) {
-    lv_label_set_text(lbl_session_pct, "---%");
-    lv_bar_set_value(bar_session, 0, LV_ANIM_OFF);
-    lv_obj_set_style_bg_color(bar_session, COL_GREEN, LV_PART_INDICATOR);
-    lv_label_set_text(lbl_session_reset, "---");
-    lv_label_set_text(lbl_weekly_pct, "---%");
-    lv_bar_set_value(bar_weekly, 0, LV_ANIM_OFF);
-    lv_obj_set_style_bg_color(bar_weekly, COL_GREEN, LV_PART_INDICATOR);
-    lv_label_set_text(lbl_weekly_reset, "---");
-    lv_label_set_text(lbl_ble_host, "Connected to: ---");
-    lv_obj_set_style_text_color(lbl_ble_host, COL_DIM, 0);
-}
 
 void ui_update(const UsageData* data) {
     if (!data->valid) return;
     s_active = data->active;
     last_update_ms = lv_tick_get();
     has_received_update = true;
+    last_data_ms = last_update_ms;
+    data_received = true;
 
     int s_pct = (int)(data->session_pct + 0.5f);
 
@@ -498,68 +462,71 @@ void ui_update(const UsageData* data) {
     format_reset_time(data->weekly_reset_mins, buf, sizeof(buf));
     lv_label_set_text(lbl_weekly_reset, buf);
 
-    if (data->host_name[0]) {
-        static char hbuf[80];
-        snprintf(hbuf, sizeof(hbuf), "Connected to: %s", data->host_name);
-        lv_label_set_text(lbl_ble_host, hbuf);
-        lv_obj_set_style_text_color(lbl_ble_host, COL_TEXT, 0);
+}
+
+// Pick the usage-view sub-screen: pairing hint (BLE down), the idle "Zzz" screen
+// (connected but data has gone stale), or the live usage panels. Only re-lays-out
+// on an actual change. The animated status line stays visible everywhere — it
+// reads "Listening…" on the idle screen, keeping it alive rather than frozen.
+static void update_view_state(void) {
+    if (!usage_group || !pair_group || !idle_group) return;
+    int v;
+    if (!s_ble_connected) {
+        v = 0;  // pairing hint
+    } else if (data_received && (lv_tick_get() - last_data_ms) < DATA_FRESH_MS) {
+        v = 2;  // live usage
+    } else {
+        v = 1;  // idle / Zzz
     }
+    if (v == view_state) return;
+    view_state = v;
+    lv_obj_add_flag(pair_group, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(idle_group, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(usage_group, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(v == 0 ? pair_group : v == 1 ? idle_group : usage_group,
+                      LV_OBJ_FLAG_HIDDEN);
 }
 
 void ui_tick_anim(void) {
     if (current_screen != SCREEN_USAGE) return;
+    update_view_state();
+    if (view_state == 1) splash_mini_tick();   // animate the sleeping creature on the idle screen
 
     uint32_t now = lv_tick_get();
-
-    if (!s_connected) {
-        if (has_received_update) {
-            uint32_t secs = (now - last_update_ms) / 1000;
-            if (secs != last_idle_secs_shown) {
-                last_idle_secs_shown = secs;
-                static char buf[40];
-                snprintf(buf, sizeof(buf), "DISCONNECTED  %lus", (unsigned long)secs);
-                lv_label_set_text(lbl_anim, buf);
-            }
-        } else {
-            lv_label_set_text(lbl_anim, "DISCONNECTED");
-        }
-        return;
-    }
-
-    if (!s_active) {
-        if (has_received_update) {
-            uint32_t secs = (now - last_update_ms) / 1000;
-            if (secs != last_idle_secs_shown) {
-                last_idle_secs_shown = secs;
-                static char buf[32];
-                snprintf(buf, sizeof(buf), "IDLE  %lus", (unsigned long)secs);
-                lv_label_set_text(lbl_anim, buf);
-            }
-        } else {
-            lv_label_set_text(lbl_anim, "IDLE");
-        }
-        return;
-    }
 
     if (now - anim_msg_start >= ANIM_MSG_MS) {
         anim_msg_idx = (anim_msg_idx + 1) % ANIM_MSG_COUNT;
         anim_msg_start = now;
     }
 
-    if (now - anim_last_ms >= spinner_ms[anim_spinner_idx]) {
-        anim_last_ms = now;
-        anim_phase = (anim_phase + 1) % SPINNER_PHASES;
-        anim_spinner_idx = (anim_phase < SPINNER_COUNT) ? anim_phase
-                                                        : (SPINNER_PHASES - anim_phase);
+    if (now - anim_last_ms < spinner_ms[anim_spinner_idx]) return;
+    anim_last_ms = now;
+    anim_phase = (anim_phase + 1) % SPINNER_PHASES;
+    anim_spinner_idx = (anim_phase < SPINNER_COUNT) ? anim_phase
+                                                    : (SPINNER_PHASES - anim_phase);
 
-        static char buf[80];
-        uint32_t secs = has_received_update ? (now - last_update_ms) / 1000 : 0;
+    static char buf[80];
+    uint32_t secs = has_received_update ? (now - last_update_ms) / 1000 : 0;
+    if (!s_ble_connected) {
+        snprintf(buf, sizeof(buf), "%s Waiting\xE2\x80\xA6",
+                 spinner_frames[anim_spinner_idx]);
+    } else if (view_state == 1) {
+        const char* text = (anim_msg_idx & 1) ? "No data" : "Listening";
+        snprintf(buf, sizeof(buf), "%s %s\xE2\x80\xA6",
+                 spinner_frames[anim_spinner_idx], text);
+    } else if (now - connected_at_ms < 5000) {
+        snprintf(buf, sizeof(buf), "%s Connected\xE2\x80\xA6",
+                 spinner_frames[anim_spinner_idx]);
+    } else if (!s_active) {
+        snprintf(buf, sizeof(buf), "%s IDLE  %lus",
+                 spinner_frames[anim_spinner_idx], (unsigned long)secs);
+    } else {
         snprintf(buf, sizeof(buf), "%s %s\xE2\x80\xA6  %lus",
                  spinner_frames[anim_spinner_idx],
                  anim_messages[anim_msg_idx],
                  (unsigned long)secs);
-        lv_label_set_text(lbl_anim, buf);
     }
+    lv_label_set_text(lbl_anim, buf);
 }
 
 static screen_t prev_non_splash_screen = SCREEN_USAGE;
@@ -575,20 +542,13 @@ static void global_click_cb(lv_event_t* e) {
     else                                  ui_show_screen(SCREEN_SPLASH);
 }
 
-static void ble_reset_click_cb(lv_event_t* e) {
-    (void)e;
-    ble_clear_bonds();
-}
-
 void ui_show_screen(screen_t screen) {
     lv_obj_add_flag(usage_container, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(ble_container, LV_OBJ_FLAG_HIDDEN);
     splash_hide();
 
     switch (screen) {
-    case SCREEN_SPLASH:     splash_show(); break;
-    case SCREEN_USAGE:      lv_obj_clear_flag(usage_container, LV_OBJ_FLAG_HIDDEN); break;
-    case SCREEN_BLUETOOTH:  lv_obj_clear_flag(ble_container, LV_OBJ_FLAG_HIDDEN); break;
+    case SCREEN_SPLASH:  splash_show(); break;
+    case SCREEN_USAGE:   lv_obj_clear_flag(usage_container, LV_OBJ_FLAG_HIDDEN); break;
     default: break;
     }
 
@@ -602,16 +562,6 @@ void ui_show_screen(screen_t screen) {
     apply_battery_visibility();
 }
 
-void ui_cycle_screen(void) {
-    screen_t next;
-    switch (current_screen) {
-    case SCREEN_USAGE:     next = SCREEN_BLUETOOTH; break;
-    case SCREEN_BLUETOOTH: next = SCREEN_USAGE;     break;
-    default:               next = SCREEN_USAGE;     break;
-    }
-    ui_show_screen(next);
-}
-
 void ui_toggle_splash(void) {
     if (current_screen == SCREEN_SPLASH) ui_show_screen(prev_non_splash_screen);
     else                                  ui_show_screen(SCREEN_SPLASH);
@@ -622,42 +572,12 @@ screen_t ui_get_current_screen(void) {
 }
 
 void ui_update_ble_status(ble_state_t state, const char* name, const char* mac) {
-    bool now_connected = (state == BLE_STATE_CONNECTED);
-    if (!now_connected && s_connected) {
-        s_active = false;
-        reset_usage_panels();
-    }
-    s_connected = now_connected;
-
-    switch (state) {
-    case BLE_STATE_CONNECTED:
-        lv_label_set_text(lbl_ble_status, "Connected");
-        lv_obj_set_style_text_color(lbl_ble_status, COL_GREEN, 0);
-        break;
-    case BLE_STATE_ADVERTISING:
-        lv_label_set_text(lbl_ble_status, "Advertising...");
-        lv_obj_set_style_text_color(lbl_ble_status, COL_AMBER, 0);
-        break;
-    case BLE_STATE_DISCONNECTED:
-        lv_label_set_text(lbl_ble_status, "Disconnected");
-        lv_obj_set_style_text_color(lbl_ble_status, COL_RED, 0);
-        break;
-    default:
-        lv_label_set_text(lbl_ble_status, "Initializing...");
-        lv_obj_set_style_text_color(lbl_ble_status, COL_DIM, 0);
-        break;
-    }
-
-    if (name) {
-        static char nbuf[48];
-        snprintf(nbuf, sizeof(nbuf), "Device: %s", name);
-        lv_label_set_text(lbl_ble_device, nbuf);
-    }
-    if (mac) {
-        static char mbuf[48];
-        snprintf(mbuf, sizeof(mbuf), "Address: %s", mac);
-        lv_label_set_text(lbl_ble_mac, mbuf);
-    }
+    (void)name; (void)mac;
+    bool was_connected = s_ble_connected;
+    s_ble_connected = (state == BLE_STATE_CONNECTED);
+    if (!s_ble_connected && was_connected) s_active = false;
+    if (s_ble_connected && !was_connected) connected_at_ms = lv_tick_get();
+    update_view_state();
 }
 
 void ui_update_battery(int percent, bool charging) {
