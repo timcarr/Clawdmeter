@@ -19,3 +19,8 @@ daemon/.venv/
 __pycache__/
 *.pyc
 daemon/daemon.log
+
+# Windows venv and PyInstaller artifacts
+.venv/
+dist/
+build/

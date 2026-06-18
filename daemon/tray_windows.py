@@ -31,6 +31,11 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
+# When frozen by PyInstaller (--onefile), bundled data files are unpacked to
+# sys._MEIPASS at runtime. Use that as the data root so logo.h is found whether
+# running from source or as a built exe.
+_DATA_ROOT = getattr(sys, '_MEIPASS', _REPO_ROOT)
+
 # Autostart launches us with the BASE interpreter's pythonw.exe, not the venv's
 # (see autostart_windows._command — the venv pythonw redirector pops a console
 # window). The base interpreter does NOT see the venv's site-packages, so add
@@ -184,7 +189,7 @@ def main() -> None:
     from daemon.icon_assets import load_logo_rgba, build_state_icons
 
     # Build per-state icons once at startup; swap icon.icon per tick (never recomposite).
-    base = load_logo_rgba(os.path.join(_REPO_ROOT, "firmware", "src", "logo.h"))
+    base = load_logo_rgba(os.path.join(_DATA_ROOT, "firmware", "src", "logo.h"))
     images = build_state_icons(base)
 
     ts = TrayState()
@@ -209,20 +214,15 @@ def main() -> None:
 
     # --- menu ---
     def _on_quit(icon_ref, _item) -> None:
-        # NEVER call ts.stop_event.set() directly from the tray thread;
-        # asyncio.Event is NOT thread-safe (RESEARCH Pitfall 2).
-        #
-        # After signalling, WAIT for the daemon thread to finish its graceful
-        # shutdown (the loop's finally: client.disconnect()) BEFORE we stop the
-        # icon and let the process exit. Without this join the daemon=True thread
-        # is killed mid-flight, the peer never gets a clean GATT disconnect, and
-        # the device sits frozen on stale data instead of returning to its waiting
-        # screen (SC#3 field report). The timeout caps the block so Quit can never
-        # hang if a WinRT disconnect wedges (rare) — we exit anyway as a fallback.
-        if ts.loop is not None and ts.stop_event is not None:
-            ts.loop.call_soon_threadsafe(ts.stop_event.set)
-            daemon_thread.join(timeout=6.0)
-        icon_ref.stop()
+        # Run in a background thread: calling icon.stop() directly from the
+        # pystray menu-callback thread on Windows causes a deadlock (the callback
+        # thread and the win32 message pump are the same context).
+        def _do_quit():
+            if ts.loop is not None and ts.stop_event is not None:
+                ts.loop.call_soon_threadsafe(ts.stop_event.set)
+                daemon_thread.join(timeout=6.0)
+            icon_ref.stop()
+        threading.Thread(target=_do_quit, daemon=True).start()
 
     def _on_toggle(_icon_ref, _item) -> None:
         if autostart.is_enabled():

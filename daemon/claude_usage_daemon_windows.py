@@ -19,18 +19,24 @@ import threading
 import time
 from pathlib import Path
 
+import socket
+
 import httpx
 from bleak import BleakClient, BleakScanner
 from bleak.exc import BleakError
 
-DEVICE_NAME = "Claude Controller"
+DEVICE_NAME = "Clawdmeter"
 SERVICE_UUID = "4c41555a-4465-7669-6365-000000000001"
 RX_CHAR_UUID = "4c41555a-4465-7669-6365-000000000002"
 REQ_CHAR_UUID = "4c41555a-4465-7669-6365-000000000004"
 
-POLL_INTERVAL = 60
+HOSTNAME = socket.gethostname()
+
+POLL_INTERVAL = 20
 TICK = 5
 SCAN_TIMEOUT = 8.0
+
+ACTIVE_THRESHOLD = 0.001
 CONNECT_RETRIES = 3        # D-01: attempts before giving up on a device
 CONNECT_RETRY_DELAY = 2.0  # D-01: seconds between failed connect attempts
 ZOMBIE_BREAK_LIMIT = 1     # D-03: consecutive write failures before abandoning a half-open link
@@ -145,6 +151,12 @@ async def poll_api(token: str) -> dict | None:
         except ValueError:
             return 0
 
+    def raw(util: str) -> float:
+        try:
+            return float(util)
+        except ValueError:
+            return 0.0
+
     payload = {
         "s": pct(hdr("anthropic-ratelimit-unified-5h-utilization")),
         "sr": reset_minutes(hdr("anthropic-ratelimit-unified-5h-reset")),
@@ -152,6 +164,8 @@ async def poll_api(token: str) -> dict | None:
         "wr": reset_minutes(hdr("anthropic-ratelimit-unified-7d-reset")),
         "st": hdr("anthropic-ratelimit-unified-5h-status", "unknown"),
         "ok": True,
+        "host": HOSTNAME,
+        "_raw_util": raw(hdr("anthropic-ratelimit-unified-5h-utilization")),
     }
     return payload
 
@@ -371,6 +385,7 @@ async def connect_and_run(device, stop_event: asyncio.Event, tray_state=None) ->
     await session.setup_refresh_subscription()
 
     last_poll = 0.0  # D-03: poll immediately on first connect
+    last_raw_util = -1.0
     used_successfully = False
     consecutive_failures = 0  # D-03: zombie-link break counter
     try:
@@ -393,6 +408,10 @@ async def connect_and_run(device, stop_event: asyncio.Event, tray_state=None) ->
                             tray_state.set_error("token expired — run claude login")
                         payload = None
                     if payload is not None:
+                        raw_util = payload.pop("_raw_util", 0.0)
+                        active = (last_raw_util >= 0 and raw_util - last_raw_util > ACTIVE_THRESHOLD)
+                        last_raw_util = raw_util
+                        payload["active"] = active
                         if await session.write_payload(payload):
                             last_poll = time.time()
                             used_successfully = True

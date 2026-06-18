@@ -56,8 +56,10 @@ def _command(tray_script: str | None = None) -> str:
                      module's own path (useful when autostart_windows.py IS
                      the entry point, but callers should pass tray_windows.py).
     """
-    pythonw = os.path.join(sys.base_exec_prefix, "pythonw.exe")
     script = os.path.abspath(tray_script if tray_script is not None else __file__)
+    if script.lower().endswith('.exe'):
+        return f'"{script}"'
+    pythonw = os.path.join(sys.base_exec_prefix, "pythonw.exe")
     return f'"{pythonw}" "{script}"'
 
 

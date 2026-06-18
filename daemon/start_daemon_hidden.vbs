@@ -1,2 +1,0 @@
-Set objShell = CreateObject("WScript.Shell")
-objShell.Run "C:\code\HermannBjorgvin\Clawdmeter\daemon\.venv\Scripts\python.exe -u C:\code\HermannBjorgvin\Clawdmeter\daemon\claude_usage_daemon.py", 0, False

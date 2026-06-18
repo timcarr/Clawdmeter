@@ -1,14 +1,11 @@
-# install-windows.ps1 - Clawdmeter Windows turnkey bootstrap (D-09)
+# install-windows.ps1 - Clawdmeter Windows turnkey bootstrap
 #
-# Creates a Python virtual environment, installs dependencies from
-# daemon\requirements-windows.txt, registers the tray app to launch at login
-# (HKCU\...\Run, no admin required), and starts the tray app immediately.
+# Creates a Python virtual environment, installs dependencies, builds
+# Clawdmeter.exe with PyInstaller, registers it to launch at login
+# (HKCU\...\Run, no admin required), and starts it immediately.
 #
 # Usage:
 #   powershell -ExecutionPolicy Bypass -File install-windows.ps1
-#
-# Or, if you have already set a permissive execution policy:
-#   .\install-windows.ps1
 #
 # To disable autostart later: right-click the tray icon -> uncheck "Start at login"
 # Or remove manually: reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v Clawdmeter /f
@@ -36,10 +33,6 @@ Log "Repository root: $RepoRoot"
 # ------------------------------------------------------------------
 # Guard: refuse to install from a WSL path (APP-02 / SC#4 / SC#5)
 # ------------------------------------------------------------------
-# If $RepoRoot lives on the WSL share (\\wsl$\... or \\wsl.localhost\...),
-# the venv and the HKCU\Run autostart entry would both point at a path that
-# disappears when WSL is shut down -- exactly the WSL-dependence this project
-# exists to eliminate. Copy the repo to a native Windows path first.
 if ($RepoRoot -match '\\\\wsl(\$|\.localhost)\\') {
     throw @"
 Refusing to install from a WSL path:
@@ -72,10 +65,9 @@ if (Test-Path $VenvDir) {
 }
 
 # ------------------------------------------------------------------
-# Step 2: Install dependencies
+# Step 2: Install dependencies (includes pyinstaller)
 # ------------------------------------------------------------------
-$PythonExe  = Join-Path $VenvDir "Scripts\python.exe"
-$PythonwExe = Join-Path $VenvDir "Scripts\pythonw.exe"
+$PythonExe = Join-Path $VenvDir "Scripts\python.exe"
 $RequirementsFile = Join-Path $RepoRoot "daemon\requirements-windows.txt"
 
 Log "Installing dependencies from daemon\requirements-windows.txt ..."
@@ -84,42 +76,34 @@ if ($LASTEXITCODE -ne 0) { throw "pip install failed (exit $LASTEXITCODE)" }
 Log "Dependencies installed"
 
 # ------------------------------------------------------------------
-# Step 3: Register autostart (HKCU\Run, per-user, no admin needed)
+# Step 3: Build Clawdmeter.exe
 # ------------------------------------------------------------------
-# Derive all paths at install time - never hard-code an absolute path that
-# breaks when the repository is moved (CLAUDE.md "repoint ExecStart" lesson,
-# RESEARCH Anti-Pattern).
-$TrayScript = Join-Path $RepoRoot "daemon\tray_windows.py"
+$SpecFile = Join-Path $RepoRoot "Clawdmeter.spec"
+$ExePath  = Join-Path $RepoRoot "dist\Clawdmeter.exe"
 
-Log "Registering autostart (HKCU\Software\Microsoft\Windows\CurrentVersion\Run) ..."
-# Invoke the autostart helper via the just-created venv python so sys.executable
-# resolves to the venv's pythonw.exe (the path that will be written to the registry).
+Log "Building Clawdmeter.exe ..."
+& $PythonExe -m PyInstaller --clean --noconfirm $SpecFile
+if ($LASTEXITCODE -ne 0) { throw "PyInstaller build failed (exit $LASTEXITCODE)" }
+if (-not (Test-Path $ExePath)) { throw "Build succeeded but dist\Clawdmeter.exe not found" }
+Log "Build complete: $ExePath"
+
+# ------------------------------------------------------------------
+# Step 4: Register autostart (HKCU\Run, per-user, no admin needed)
+# ------------------------------------------------------------------
+Log "Registering autostart ..."
 & $PythonExe -c @"
-import sys, os
+import sys
 sys.path.insert(0, r'$RepoRoot')
 import daemon.autostart_windows as a
-a.enable(tray_script=r'$TrayScript')
+a.enable(tray_script=r'$ExePath')
 "@
 if ($LASTEXITCODE -ne 0) { throw "Autostart registration failed (exit $LASTEXITCODE)" }
 Log "Autostart registered - Clawdmeter will launch automatically at next logon"
 
 # ------------------------------------------------------------------
-# Step 4: Launch the tray app (headless - BASE pythonw.exe, no console window)
+# Step 5: Launch
 # ------------------------------------------------------------------
-# Use the BASE interpreter's pythonw.exe, NOT the venv's Scripts\pythonw.exe.
-# The venv pythonw is a redirector stub that re-launches the CONSOLE python.exe
-# build as a child (a CPython venv-launcher bug), popping a black console window.
-# tray_windows.py adds the venv site-packages to sys.path itself, so the venv's
-# dependencies still resolve. (See autostart_windows._command - same rationale.)
-$BasePrefix  = & $PythonExe -c "import sys; print(sys.base_exec_prefix)"
-$BasePythonw = Join-Path $BasePrefix "pythonw.exe"
-
-Log "Launching tray app ..."
-$StartArgs = @{
-    FilePath         = $BasePythonw
-    ArgumentList     = "`"$TrayScript`""
-    WorkingDirectory = $RepoRoot
-}
-Start-Process @StartArgs
-Log "Tray app started - look for the Clawdmeter icon in your notification area"
+Log "Launching Clawdmeter ..."
+Start-Process $ExePath -WorkingDirectory $RepoRoot
+Log "Clawdmeter started - look for the icon in your notification area"
 Log "=== Install complete ==="
