@@ -1,2 +1,1 @@
-cd C:\code\timcarr\Clawdmeter\firmware
-python -m platformio run -e waveshare_amoled_18 -t upload --upload-port COM3
+& "$env:USERPROFILE\.platformio\penv\Scripts\pio.exe" run -d C:\code\timcarr\Clawdmeter\firmware -e waveshare_amoled_18 -t upload --upload-port COM3
