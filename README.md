@@ -12,6 +12,16 @@ Shift+Tab over BLE HID for Claude Code's voice mode and mode-toggle shortcuts.
 
 The Clawd animations come from [claudepix](https://claudepix.vercel.app), [@amaanbuilds](https://x.com/amaanbuilds)'s library of pixel-art Clawd sprites, check it out, it's lovely.
 
+## About this fork
+
+This is a fork of [HermannBjorgvin/Clawdmeter](https://github.com/HermannBjorgvin/Clawdmeter), focused on running the host daemon on **native Windows** with the **Waveshare AMOLED-1.8** board. Differences from upstream:
+
+- **Polling is free.** Upstream's daemon sends a minimal billed Haiku message and scrapes the usage numbers off the response's rate-limit headers — which slowly eats your own quota just to display it (~1%/hour at short poll intervals). This fork queries the OAuth usage endpoint instead (`api.anthropic.com/api/oauth/usage`, the same endpoint Claude Code's `/usage` command uses), which reports session/weekly utilization directly and consumes **zero tokens**. All three daemon variants (Windows, macOS/Linux Python, Linux bash) are converted.
+- **Windows daemon hardening.** PyInstaller one-file exe build (`Clawdmeter.spec`), tray/installer refinements, rotating file log at `%LOCALAPPDATA%\Clawdmeter\daemon.log` (so the headless tray app is debuggable), and a clean Quit path.
+- **Usage screen extras.** "Connected to: \<PC-name\>" line, time since the last data refresh, an IDLE indicator when your usage isn't rising, and DISCONNECTED + zeroed meters when the BLE link drops (instead of silently showing stale numbers).
+- **AMOLED-1.8 fixes.** PWR-button screen switching and power handling on the 1.8 board.
+- **Wire protocol additions.** The daemon payload carries two extra fields: `host` (daemon PC's hostname) and `active` (whether usage is currently rising) — see [BLE protocol](#ble-protocol).
+
 ## Screens
 
 The device boots into the splash. Tap the screen anywhere to switch to the Usage view; tap again to flip back to the splash.
@@ -186,8 +196,8 @@ reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v Clawdmeter /f
 ## How it works
 
 1. The daemon reads your Claude Code OAuth token — from the macOS Keychain (service `Claude Code-credentials`) on macOS, or from `~/.claude/.credentials.json` on Linux (`%USERPROFILE%\.claude\.credentials.json` on Windows).
-2. It makes a minimal API call to `api.anthropic.com/v1/messages` — one token of Haiku, basically free.
-3. The usage numbers come straight out of the response headers (`anthropic-ratelimit-unified-5h-utilization` and friends).
+2. Every 60 seconds it GETs `api.anthropic.com/api/oauth/usage` — the same endpoint Claude Code's `/usage` command uses. It consumes no tokens, so keeping the meter alive costs nothing.
+3. The response body carries session (`five_hour`) and weekly (`seven_day`) utilization percentages plus reset timestamps.
 4. The daemon connects to the ESP32 over BLE and writes a JSON payload to the GATT RX characteristic.
 5. The firmware parses it and updates the LVGL dashboard.
 6. The firmware also tracks the rate of change of session % over a 5-minute window and picks splash animations from the matching mood group.
@@ -219,10 +229,10 @@ The device advertises a custom GATT service alongside the standard HID keyboard 
 JSON payload format (written to RX):
 
 ```json
-{ "s": 45, "sr": 120, "w": 28, "wr": 7200, "st": "allowed", "ok": true }
+{ "s": 45, "sr": 120, "w": 28, "wr": 7200, "st": "allowed", "ok": true, "host": "MERLIN", "active": true }
 ```
 
-Fields: `s` = session %, `sr` = session reset (minutes), `w` = weekly %, `wr` = weekly reset (minutes), `st` = status, `ok` = success flag.
+Fields: `s` = session %, `sr` = session reset (minutes), `w` = weekly %, `wr` = weekly reset (minutes), `st` = status, `ok` = success flag, `host` = daemon PC's hostname (fork addition, shown as "Connected to: …"), `active` = usage currently rising (fork addition, drives the IDLE indicator).
 
 ## Recompiling fonts
 

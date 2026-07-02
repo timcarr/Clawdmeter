@@ -108,7 +108,7 @@ python daemon\claude_usage_daemon_windows.py
 [HH:MM:SS] Found: XX:XX:XX:XX:XX:XX
 [HH:MM:SS] Connecting to XX:XX:XX:XX:XX:XX...
 [HH:MM:SS] Connected
-[HH:MM:SS] Sending: {"s":42,"sr":180,"w":17,"wr":8820,"st":"active","ok":true}
+[HH:MM:SS] Sending: {"s":42,"sr":180,"w":17,"wr":8820,"st":"allowed","ok":true,"host":"MYPC","active":false}
 ```
 
 - **The device must be paired with Windows first** (see [Pair the device](#pair-the-device-one-time)).
