@@ -17,7 +17,7 @@ The Clawd animations come from [claudepix](https://claudepix.vercel.app), [@amaa
 This is a fork of [HermannBjorgvin/Clawdmeter](https://github.com/HermannBjorgvin/Clawdmeter), focused on running the host daemon on **native Windows** with the **Waveshare AMOLED-1.8** board. Differences from upstream:
 
 - **Polling is free.** Upstream's daemon sends a minimal billed Haiku message and scrapes the usage numbers off the response's rate-limit headers — which slowly eats your own quota just to display it (~1%/hour at short poll intervals). This fork queries the OAuth usage endpoint instead (`api.anthropic.com/api/oauth/usage`, the same endpoint Claude Code's `/usage` command uses), which reports session/weekly utilization directly and consumes **zero tokens**. All three daemon variants (Windows, macOS/Linux Python, Linux bash) are converted.
-- **Adaptive poll cadence.** The daemon polls every **15 s while your usage is rising** and drops to **60 s when idle**, so the meter feels real-time exactly when you're using Claude. If the usage endpoint ever rate-limits (HTTP 429), the daemon holds the 60 s cadence for 15 minutes and then tries fast polling again.
+- **Adaptive poll cadence.** The daemon polls every **30 s while your usage is rising** and drops to **60 s when idle**, so the meter feels real-time exactly when you're using Claude. (The endpoint reports whole percents that move about once a minute under heavy use, so faster polling buys nothing — and its rate limiter trips quickly below ~30 s.) If the endpoint ever rate-limits (HTTP 429), the daemon holds the 60 s cadence until 5 minutes after the last 429, then tries fast polling again.
 - **Windows daemon hardening.** PyInstaller one-file exe build (`Clawdmeter.spec`), tray/installer refinements, rotating file log at `%LOCALAPPDATA%\Clawdmeter\daemon.log` (so the headless tray app is debuggable), and a clean Quit path.
 - **Usage screen extras.** "Connected to: \<PC-name\>" line, time since the last data refresh, an IDLE indicator when your usage isn't rising, and DISCONNECTED + zeroed meters when the BLE link drops (instead of silently showing stale numbers).
 - **AMOLED-1.8 fixes.** PWR-button screen switching and power handling on the 1.8 board.
@@ -197,7 +197,7 @@ reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v Clawdmeter /f
 ## How it works
 
 1. The daemon reads your Claude Code OAuth token — from the macOS Keychain (service `Claude Code-credentials`) on macOS, or from `~/.claude/.credentials.json` on Linux (`%USERPROFILE%\.claude\.credentials.json` on Windows).
-2. It GETs `api.anthropic.com/api/oauth/usage` — the same endpoint Claude Code's `/usage` command uses. It consumes no tokens, so keeping the meter alive costs nothing. Cadence is adaptive: every 15 s while usage is rising, every 60 s when idle, and pinned to 60 s for 15 minutes if the endpoint returns a 429.
+2. It GETs `api.anthropic.com/api/oauth/usage` — the same endpoint Claude Code's `/usage` command uses. It consumes no tokens, so keeping the meter alive costs nothing. Cadence is adaptive: every 30 s while usage is rising, every 60 s when idle, and pinned to 60 s until 5 minutes after the last HTTP 429 if the endpoint rate-limits.
 3. The response body carries session (`five_hour`) and weekly (`seven_day`) utilization percentages plus reset timestamps.
 4. The daemon connects to the ESP32 over BLE and writes a JSON payload to the GATT RX characteristic.
 5. The firmware parses it and updates the LVGL dashboard.

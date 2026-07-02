@@ -46,8 +46,13 @@ REQ_CHAR_UUID = "4c41555a-4465-7669-6365-000000000004"
 HOSTNAME = socket.gethostname()
 
 POLL_INTERVAL = 60          # idle cadence: usage isn't rising
-POLL_INTERVAL_ACTIVE = 15   # fast cadence: usage rose on the last poll
-RATE_LIMIT_COOLDOWN = 900   # after a 429, hold the idle cadence this long (self-heals)
+POLL_INTERVAL_ACTIVE = 30   # fast cadence: usage rose on the last poll. The endpoint
+                            # reports whole percents that step ~1x/min under heavy use,
+                            # and its rate limiter trips well below 15s polling — 30s
+                            # catches every step with half the request pressure.
+RATE_LIMIT_COOLDOWN = 300   # resume fast polling this long after the LAST 429 — a 429
+                            # during cooldown (on a 60s poll) re-arms it, so short is safe.
+                            # Observed penalty is ~5 min.
 TICK = 5
 SCAN_TIMEOUT = 8.0
 
