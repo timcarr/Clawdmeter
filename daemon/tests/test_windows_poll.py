@@ -15,7 +15,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from daemon.claude_usage_daemon_windows import AuthError, poll_api
+from daemon.claude_usage_daemon_windows import AuthError, RateLimited, poll_api
 
 
 # ---------------------------------------------------------------------------
@@ -223,8 +223,8 @@ def test_non_dict_json_returns_none():
 # ---------------------------------------------------------------------------
 
 def test_poll_api_returns_none_on_4xx():
-    """poll_api returns None when response status code is >= 400."""
-    assert _poll_with(_make_mock_response(status_code=429)) is None
+    """poll_api returns None when response status code is >= 400 (except 401/403/429)."""
+    assert _poll_with(_make_mock_response(status_code=404)) is None
 
 
 def test_poll_api_returns_none_on_5xx():
@@ -245,10 +245,12 @@ def test_poll_api_raises_autherror_on_401_403(status):
         _poll_with(_make_mock_response(status_code=status))
 
 
-def test_poll_api_returns_none_not_autherror_on_429():
-    """Rate-limit (429) is transient — None, NOT AuthError. Matters more now:
-    the usage endpoint has its own per-token rate limit."""
-    assert _poll_with(_make_mock_response(status_code=429)) is None
+def test_poll_api_raises_ratelimited_on_429():
+    """A 429 raises RateLimited so the poll loop can back off to the idle
+    cadence — and it must NOT be an AuthError (no 'token expired' toast)."""
+    with pytest.raises(RateLimited):
+        _poll_with(_make_mock_response(status_code=429))
+    assert not issubclass(RateLimited, AuthError)
 
 
 # ---------------------------------------------------------------------------

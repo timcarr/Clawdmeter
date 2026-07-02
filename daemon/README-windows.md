@@ -103,7 +103,7 @@ python daemon\claude_usage_daemon_windows.py
 
 ```
 [HH:MM:SS] === Claude Usage Tracker Daemon (BLE, Windows) ===
-[HH:MM:SS] Poll interval: 60s
+[HH:MM:SS] Poll interval: 60s idle / 15s active
 [HH:MM:SS] Scanning for 'Claude Controller' (8.0s)...
 [HH:MM:SS] Found: XX:XX:XX:XX:XX:XX
 [HH:MM:SS] Connecting to XX:XX:XX:XX:XX:XX...
@@ -118,9 +118,10 @@ python daemon\claude_usage_daemon_windows.py
   payload within a few seconds of connect (warm token path). With a valid, non-expired token
   the device should leave its waiting screen and show session + weekly percentages within
   about 10 seconds of launch.
-- The daemon then re-polls every 60 seconds while connected. If the device fires a refresh
-  request (e.g., after a button press), an immediate re-poll occurs without waiting for the
-  60-second interval.
+- The daemon then re-polls while connected: every 15 seconds while your usage is rising,
+  every 60 seconds when idle. If the usage endpoint rate-limits (HTTP 429), it holds the
+  60-second cadence for 15 minutes before trying fast polling again. If the device fires a
+  refresh request, an immediate re-poll occurs without waiting for the interval.
 - If the device disconnects or goes out of range, the daemon logs `Device disconnected` and
   re-scans automatically with exponential backoff (starting at 1 second, capped at 60 seconds).
 

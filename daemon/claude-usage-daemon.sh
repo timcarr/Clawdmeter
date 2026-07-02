@@ -9,7 +9,9 @@ DEVICE_MAC="${DEVICE_MAC:-}"  # auto-discovered if empty
 SERVICE_UUID="4c41555a-4465-7669-6365-000000000001"
 RX_CHAR_UUID="4c41555a-4465-7669-6365-000000000002"
 REQ_CHAR_UUID="4c41555a-4465-7669-6365-000000000004"
-POLL_INTERVAL=60
+POLL_INTERVAL=60          # idle cadence: usage isn't rising
+POLL_INTERVAL_ACTIVE=15   # fast cadence: usage rose on the last poll
+RATE_LIMIT_COOLDOWN=900   # after a 429, hold the idle cadence this long (self-heals)
 TICK=5
 SAVED_MAC_FILE="$HOME/.config/claude-usage-monitor/ble-address"
 REFRESH_FLAG="/tmp/claude-usage-refresh-$$"
@@ -211,13 +213,24 @@ poll() {
     # 1-token Haiku message just to scrape the rate-limit headers.
     # The claude-code User-Agent is required: without it this endpoint lands
     # in an aggressively rate-limited bucket and returns persistent 429s.
-    local body
-    body=$(curl -s \
+    local resp http_code body
+    resp=$(curl -s -w $'\n%{http_code}' \
         "https://api.anthropic.com/api/oauth/usage" \
         -H "Authorization: Bearer $token" \
         -H "anthropic-beta: oauth-2025-04-20" \
         -H "User-Agent: claude-code/2.1.5" \
         2>/dev/null) || { log "Error: API call failed"; return 1; }
+    http_code=$(echo "$resp" | tail -n1)
+    body=$(echo "$resp" | sed '$d')
+
+    if [ "$http_code" = "429" ]; then
+        log "API HTTP 429 (rate limited)"
+        return 2   # caller backs off to the idle cadence
+    fi
+    if [ "$http_code" -ge 400 ] 2>/dev/null; then
+        log "API HTTP $http_code: $(echo "$body" | head -c 200)"
+        return 1
+    fi
 
     # utilization is a 0-100 percentage; resets_at is ISO 8601 UTC
     local s5h_util s5h_reset s7d_util s7d_reset
@@ -243,6 +256,7 @@ poll() {
 
     # Active when utilization rose more than ACTIVE_THRESHOLD since the last poll.
     # Goes idle the moment the API stops reporting a rise — no artificial holdoff.
+    # _LAST_ACTIVE is global: the main loop uses it to pick the poll cadence.
     local active="false"
     if [ -n "$_PREV_UTIL" ]; then
         local delta
@@ -252,6 +266,7 @@ poll() {
         fi
     fi
     _PREV_UTIL="$s5h_util"
+    _LAST_ACTIVE="$active"
 
     local host_name
     host_name=$(hostname)
@@ -279,7 +294,7 @@ cleanup() {
 trap cleanup INT TERM
 
 log "=== Claude Usage Tracker Daemon (BLE) ==="
-log "Poll interval: ${POLL_INTERVAL}s"
+log "Poll interval: ${POLL_INTERVAL}s idle / ${POLL_INTERVAL_ACTIVE}s active"
 
 # Minimum per-poll rise in 5h utilization (0-100 percent scale) to count as
 # real usage. The usage endpoint reports whole percents, so any real rise is
@@ -287,7 +302,9 @@ log "Poll interval: ${POLL_INTERVAL}s"
 ACTIVE_THRESHOLD=0.001
 
 BACKOFF=1
-_PREV_UTIL=""  # raw float from last successful poll; empty until first poll
+_PREV_UTIL=""           # raw float from last successful poll; empty until first poll
+_LAST_ACTIVE="false"    # last poll's activity verdict — picks the poll cadence
+_RATE_LIMITED_UNTIL=0   # 429 backoff: hold the idle cadence until this epoch time
 
 while true; do
     # Find the device
@@ -325,15 +342,32 @@ while true; do
 
     # Poll loop: tick every $TICK seconds. Poll Anthropic when the
     # interval has elapsed OR when the ESP requested a refresh.
+    # Adaptive cadence: poll fast while usage is rising, slow when idle
+    # or while the endpoint is rate-limiting us.
     LAST_POLL=0
     while is_connected; do
         NOW=$(date +%s)
-        if [ -f "$REFRESH_FLAG" ] || (( NOW - LAST_POLL >= POLL_INTERVAL )); then
+        CUR_INTERVAL=$POLL_INTERVAL
+        if [ "$_LAST_ACTIVE" = "true" ] && (( NOW >= _RATE_LIMITED_UNTIL )); then
+            CUR_INTERVAL=$POLL_INTERVAL_ACTIVE
+        fi
+        if [ -f "$REFRESH_FLAG" ] || (( NOW - LAST_POLL >= CUR_INTERVAL )); then
             if [ -f "$REFRESH_FLAG" ]; then
                 log "Refresh requested by device"
                 rm -f "$REFRESH_FLAG"
             fi
-            poll && LAST_POLL=$NOW
+            poll
+            case $? in
+                0) LAST_POLL=$NOW ;;
+                2)
+                    # Rate limited: back off to the idle cadence and count this
+                    # attempt as a full interval so we don't retry every tick.
+                    _RATE_LIMITED_UNTIL=$((NOW + RATE_LIMIT_COOLDOWN))
+                    _LAST_ACTIVE="false"
+                    LAST_POLL=$NOW
+                    log "Holding ${POLL_INTERVAL}s cadence for $((RATE_LIMIT_COOLDOWN / 60)) min"
+                    ;;
+            esac
         fi
         sleep "$TICK"
     done

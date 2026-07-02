@@ -45,7 +45,9 @@ REQ_CHAR_UUID = "4c41555a-4465-7669-6365-000000000004"
 
 HOSTNAME = socket.gethostname()
 
-POLL_INTERVAL = 60
+POLL_INTERVAL = 60          # idle cadence: usage isn't rising
+POLL_INTERVAL_ACTIVE = 15   # fast cadence: usage rose on the last poll
+RATE_LIMIT_COOLDOWN = 900   # after a 429, hold the idle cadence this long (self-heals)
 TICK = 5
 SCAN_TIMEOUT = 8.0
 
@@ -291,6 +293,20 @@ async def discover_target(skip_addr: str | None = None):
     return address
 
 
+class RateLimited(Exception):
+    """Raised by poll_api on a 429 — the usage endpoint is rate-limiting this
+    token. The poll loop reacts by holding the idle cadence (POLL_INTERVAL) for
+    RATE_LIMIT_COOLDOWN instead of retrying every tick."""
+
+
+def poll_interval(active: bool, now: float, rate_limited_until: float) -> float:
+    """Adaptive cadence: fast while usage is rising, idle otherwise — and idle
+    unconditionally during a 429 cooldown."""
+    if active and now >= rate_limited_until:
+        return POLL_INTERVAL_ACTIVE
+    return POLL_INTERVAL
+
+
 async def poll_api(token: str) -> dict | None:
     headers = dict(API_HEADERS_TEMPLATE)
     headers["Authorization"] = f"Bearer {token}"
@@ -300,6 +316,10 @@ async def poll_api(token: str) -> dict | None:
     except httpx.HTTPError as e:
         log(f"API call failed: {e}")
         return None
+    if resp.status_code == 429:
+        # The usage endpoint has its own per-token rate limit — back off.
+        log(f"API HTTP 429 (rate limited): {resp.text[:200]}")
+        raise RateLimited()
     if resp.status_code >= 400:
         log(f"API HTTP {resp.status_code}: {resp.text[:200]}")
         return None
@@ -410,18 +430,31 @@ async def connect_and_run(target, stop_event: asyncio.Event) -> bool:
 
     last_poll = 0.0
     last_raw_util = -1.0
+    active = False             # last poll's verdict — picks the cadence below
+    rate_limited_until = 0.0   # 429 backoff: hold the idle cadence until then
     used_successfully = False
     try:
         while client.is_connected and not stop_event.is_set():
             now = time.time()
             elapsed = now - last_poll
-            if session.refresh_requested.is_set() or elapsed >= POLL_INTERVAL:
+            interval = poll_interval(active, now, rate_limited_until)
+            if session.refresh_requested.is_set() or elapsed >= interval:
                 session.refresh_requested.clear()
                 token = read_token()
                 if not token:
                     log("No token; skipping poll")
                 else:
-                    payload = await poll_api(token)
+                    try:
+                        payload = await poll_api(token)
+                    except RateLimited:
+                        # Back off to the idle cadence and don't re-attempt every
+                        # tick (a failed poll normally retries at TICK) — count
+                        # this attempt as a full interval.
+                        rate_limited_until = time.time() + RATE_LIMIT_COOLDOWN
+                        active = False
+                        last_poll = time.time()
+                        log(f"Holding {POLL_INTERVAL}s cadence for {RATE_LIMIT_COOLDOWN // 60} min")
+                        payload = None
                     if payload is not None:
                         raw_util = payload.pop("_raw_util", 0.0)
                         active = (last_raw_util >= 0 and raw_util - last_raw_util > ACTIVE_THRESHOLD)
@@ -460,7 +493,7 @@ async def main() -> None:
             signal.signal(sig, _stop)
 
     log("=== Claude Usage Tracker Daemon (BLE, macOS) ===")
-    log(f"Poll interval: {POLL_INTERVAL}s")
+    log(f"Poll interval: {POLL_INTERVAL}s idle / {POLL_INTERVAL_ACTIVE}s active")
 
     backoff = 1
     skip_addr: str | None = None  # macOS: a peripheral to skip for one cycle

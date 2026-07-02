@@ -32,7 +32,9 @@ REQ_CHAR_UUID = "4c41555a-4465-7669-6365-000000000004"
 
 HOSTNAME = socket.gethostname()
 
-POLL_INTERVAL = 60
+POLL_INTERVAL = 60          # idle cadence: usage isn't rising
+POLL_INTERVAL_ACTIVE = 15   # fast cadence: usage rose on the last poll
+RATE_LIMIT_COOLDOWN = 900   # after a 429, hold the idle cadence this long (self-heals)
 TICK = 5
 SCAN_TIMEOUT = 8.0
 
@@ -107,9 +109,23 @@ def log(msg: str) -> None:
 class AuthError(Exception):
     """Raised by poll_api on a genuine 401/403 — the token really is expired or
     invalid and the user must re-run `claude login`. Distinct from a None return,
-    which means a TRANSIENT failure (network/DNS, timeout, rate-limit, 5xx) that
-    must NOT be mislabeled as a token problem (SC#5: a boot-time `getaddrinfo
-    failed` DNS blip wrongly fired the 'token expired' toast)."""
+    which means a TRANSIENT failure (network/DNS, timeout, 5xx) that must NOT be
+    mislabeled as a token problem (SC#5: a boot-time `getaddrinfo failed` DNS
+    blip wrongly fired the 'token expired' toast)."""
+
+
+class RateLimited(Exception):
+    """Raised by poll_api on a 429 — the usage endpoint is rate-limiting this
+    token. The poll loop reacts by holding the idle cadence (POLL_INTERVAL) for
+    RATE_LIMIT_COOLDOWN instead of retrying every tick."""
+
+
+def poll_interval(active: bool, now: float, rate_limited_until: float) -> float:
+    """Adaptive cadence: fast while usage is rising, idle otherwise — and idle
+    unconditionally during a 429 cooldown."""
+    if active and now >= rate_limited_until:
+        return POLL_INTERVAL_ACTIVE
+    return POLL_INTERVAL
 
 
 async def poll_api(token: str) -> dict | None:
@@ -127,8 +143,12 @@ async def poll_api(token: str) -> dict | None:
         # "run claude login" toast.
         log(f"API HTTP {resp.status_code}: {resp.text[:200]}")
         raise AuthError(resp.status_code)
+    if resp.status_code == 429:
+        # The usage endpoint has its own per-token rate limit — back off.
+        log(f"API HTTP 429 (rate limited): {resp.text[:200]}")
+        raise RateLimited()
     if resp.status_code >= 400:
-        # Other 4xx/5xx (rate-limit, server error) — transient, not a token issue.
+        # Other 4xx/5xx (server error etc.) — transient, not a token issue.
         log(f"API HTTP {resp.status_code}: {resp.text[:200]}")
         return None
     try:
@@ -401,13 +421,16 @@ async def connect_and_run(device, stop_event: asyncio.Event, tray_state=None) ->
 
     last_poll = 0.0  # D-03: poll immediately on first connect
     last_raw_util = -1.0
+    active = False             # last poll's verdict — picks the cadence below
+    rate_limited_until = 0.0   # 429 backoff: hold the idle cadence until then
     used_successfully = False
     consecutive_failures = 0  # D-03: zombie-link break counter
     try:
         while client.is_connected and not stop_event.is_set():
             now = time.time()
             elapsed = now - last_poll
-            if session.refresh_requested.is_set() or elapsed >= POLL_INTERVAL:
+            interval = poll_interval(active, now, rate_limited_until)
+            if session.refresh_requested.is_set() or elapsed >= interval:
                 session.refresh_requested.clear()
                 token = read_token()  # D-09: fresh each cycle
                 if not token:
@@ -421,6 +444,15 @@ async def connect_and_run(device, stop_event: asyncio.Event, tray_state=None) ->
                         # Real 401/403 — token genuinely needs a refresh.
                         if tray_state:
                             tray_state.set_error("token expired — run claude login")
+                        payload = None
+                    except RateLimited:
+                        # Back off to the idle cadence and don't re-attempt every
+                        # tick (a failed poll normally retries at TICK) — count
+                        # this attempt as a full interval.
+                        rate_limited_until = time.time() + RATE_LIMIT_COOLDOWN
+                        active = False
+                        last_poll = time.time()
+                        log(f"Holding {POLL_INTERVAL}s cadence for {RATE_LIMIT_COOLDOWN // 60} min")
                         payload = None
                     if payload is not None:
                         raw_util = payload.pop("_raw_util", 0.0)
@@ -507,7 +539,7 @@ async def main(tray_state=None) -> None:
                     pass
 
     log("=== Claude Usage Tracker Daemon (BLE, Windows) ===")
-    log(f"Poll interval: {POLL_INTERVAL}s")
+    log(f"Poll interval: {POLL_INTERVAL}s idle / {POLL_INTERVAL_ACTIVE}s active")
 
     # D-05: two distinct backoff regimes — slow-search (device absent) vs fast-reconnect (link dropped)
     search_backoff = 1     # caps at 60s — gentle, for a device that is genuinely absent/off
