@@ -9,7 +9,7 @@ DEVICE_MAC="${DEVICE_MAC:-}"  # auto-discovered if empty
 SERVICE_UUID="4c41555a-4465-7669-6365-000000000001"
 RX_CHAR_UUID="4c41555a-4465-7669-6365-000000000002"
 REQ_CHAR_UUID="4c41555a-4465-7669-6365-000000000004"
-POLL_INTERVAL=20 # was 60
+POLL_INTERVAL=60
 TICK=5
 SAVED_MAC_FILE="$HOME/.config/claude-usage-monitor/ble-address"
 REFRESH_FLAG="/tmp/claude-usage-refresh-$$"
@@ -191,35 +191,55 @@ write_gatt() {
         WriteValue "aya{sv}" "$count" $bytes 0 2>/dev/null
 }
 
+# Extract a scalar field from a named top-level object in the usage JSON,
+# e.g. _json_field "$body" five_hour utilization. Works because the windows'
+# objects contain only scalar fields (no nesting inside them).
+_json_field() {
+    local body="$1" obj="$2" field="$3"
+    echo "$body" | grep -o "\"$obj\":{[^}]*}" | grep -o "\"$field\":\(\"[^\"]*\"\|[0-9.]\+\)" \
+        | head -1 | sed -e "s/^\"$field\"://" -e 's/^"//' -e 's/"$//'
+}
+
 poll() {
     local token
     token=$(read_token) || { log "Error: could not read token"; return 1; }
     local now
     now=$(date +%s)
 
-    local headers
-    headers=$(curl -s -D - -o /dev/null \
-        "https://api.anthropic.com/v1/messages" \
+    # The OAuth usage endpoint (what Claude Code's /usage command calls).
+    # Consumes ZERO tokens — unlike the old approach of sending a billed
+    # 1-token Haiku message just to scrape the rate-limit headers.
+    # The claude-code User-Agent is required: without it this endpoint lands
+    # in an aggressively rate-limited bucket and returns persistent 429s.
+    local body
+    body=$(curl -s \
+        "https://api.anthropic.com/api/oauth/usage" \
         -H "Authorization: Bearer $token" \
-        -H "anthropic-version: 2023-06-01" \
         -H "anthropic-beta: oauth-2025-04-20" \
-        -H "Content-Type: application/json" \
         -H "User-Agent: claude-code/2.1.5" \
-        -d '{"model":"claude-haiku-4-5-20251001","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}' \
         2>/dev/null) || { log "Error: API call failed"; return 1; }
 
-    local s5h_util s5h_reset s7d_util s7d_reset status
-    s5h_util=$(echo "$headers" | grep -i "anthropic-ratelimit-unified-5h-utilization" | tr -d '\r' | awk '{print $2}')
-    s5h_reset=$(echo "$headers" | grep -i "anthropic-ratelimit-unified-5h-reset" | tr -d '\r' | awk '{print $2}')
-    s7d_util=$(echo "$headers" | grep -i "anthropic-ratelimit-unified-7d-utilization" | tr -d '\r' | awk '{print $2}')
-    s7d_reset=$(echo "$headers" | grep -i "anthropic-ratelimit-unified-7d-reset" | tr -d '\r' | awk '{print $2}')
-    status=$(echo "$headers" | grep -i "anthropic-ratelimit-unified-5h-status" | tr -d '\r' | awk '{print $2}')
+    # utilization is a 0-100 percentage; resets_at is ISO 8601 UTC
+    local s5h_util s5h_reset s7d_util s7d_reset
+    s5h_util=$(_json_field "$body" five_hour utilization)
+    s5h_reset=$(_json_field "$body" five_hour resets_at)
+    s7d_util=$(_json_field "$body" seven_day utilization)
+    s7d_reset=$(_json_field "$body" seven_day resets_at)
 
-    s5h_util=${s5h_util:-0}
-    s5h_reset=${s5h_reset:-0}
+    if [ -z "$s5h_util" ]; then
+        log "Error: no usage data in response: $(echo "$body" | head -c 200)"
+        return 1
+    fi
+
+    # ISO 8601 -> epoch seconds (GNU date); 0 on parse failure
+    s5h_reset=$(date -d "$s5h_reset" +%s 2>/dev/null || echo 0)
+    s7d_reset=$(date -d "$s7d_reset" +%s 2>/dev/null || echo 0)
     s7d_util=${s7d_util:-0}
-    s7d_reset=${s7d_reset:-0}
-    status=${status:-unknown}
+
+    local status="allowed"
+    if [ "$(echo "$s5h_util >= 100" | bc -l)" = "1" ]; then
+        status="limited"
+    fi
 
     # Active when utilization rose more than ACTIVE_THRESHOLD since the last poll.
     # Goes idle the moment the API stops reporting a rise — no artificial holdoff.
@@ -238,9 +258,9 @@ poll() {
     local payload
     payload=$(awk -v u5="$s5h_util" -v r5="$s5h_reset" -v u7="$s7d_util" -v r7="$s7d_reset" -v st="$status" -v now="$now" -v host="$host_name" -v act="$active" \
         'BEGIN {
-            sp = sprintf("%.0f", u5 * 100);
+            sp = sprintf("%.0f", u5);
             sr = (r5 - now) / 60; sr = sr > 0 ? sprintf("%.0f", sr) : 0;
-            wp = sprintf("%.0f", u7 * 100);
+            wp = sprintf("%.0f", u7);
             wr = (r7 - now) / 60; wr = wr > 0 ? sprintf("%.0f", wr) : 0;
             printf "{\"s\":%s,\"sr\":%s,\"w\":%s,\"wr\":%s,\"st\":\"%s\",\"ok\":true,\"host\":\"%s\",\"active\":%s}", sp, sr, wp, wr, st, host, act;
         }')
@@ -261,9 +281,9 @@ trap cleanup INT TERM
 log "=== Claude Usage Tracker Daemon (BLE) ==="
 log "Poll interval: ${POLL_INTERVAL}s"
 
-# Minimum per-poll rise in 5h utilization to count as real usage.
-# Must be above the daemon's own dummy-call noise (~50 tokens / your 5h quota).
-# Raise this if the daemon's haiku calls alone keep triggering active.
+# Minimum per-poll rise in 5h utilization (0-100 percent scale) to count as
+# real usage. The usage endpoint reports whole percents, so any real rise is
+# >=1 (and the daemon's own polls are free — no self-noise to filter anymore).
 ACTIVE_THRESHOLD=0.001
 
 BACKOFF=1

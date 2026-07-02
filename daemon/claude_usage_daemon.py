@@ -7,6 +7,7 @@ bleak (CoreBluetooth backend on macOS).
 """
 
 import asyncio
+import datetime
 import getpass
 import json
 import os
@@ -44,13 +45,13 @@ REQ_CHAR_UUID = "4c41555a-4465-7669-6365-000000000004"
 
 HOSTNAME = socket.gethostname()
 
-POLL_INTERVAL = 20  # was 60
+POLL_INTERVAL = 60
 TICK = 5
 SCAN_TIMEOUT = 8.0
 
 # Minimum per-poll rise in 5h utilization (0–1) to count as real usage.
-# Must be above the daemon's own dummy-call noise (~50 tokens / your 5h quota).
-# Raise if the daemon's haiku calls alone keep triggering active.
+# The usage endpoint reports whole percents, so any real rise is ≥0.01
+# (and the daemon's own polls are free — no self-noise to filter anymore).
 ACTIVE_THRESHOLD = 0.001
 
 # macOS: token lives in Keychain (service "Claude Code-credentials").
@@ -59,17 +60,16 @@ KEYCHAIN_SERVICE = "Claude Code-credentials"
 CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
 SAVED_ADDR_FILE = Path.home() / ".config" / "claude-usage-monitor" / "ble-address"
 
-API_URL = "https://api.anthropic.com/v1/messages"
+# The OAuth usage endpoint (what Claude Code's /usage command calls). Returns
+# utilization/reset data directly and consumes ZERO tokens — unlike the old
+# approach of sending a billed 1-token Haiku message just to scrape the
+# rate-limit headers off the response.
+API_URL = "https://api.anthropic.com/api/oauth/usage"
 API_HEADERS_TEMPLATE = {
-    "anthropic-version": "2023-06-01",
     "anthropic-beta": "oauth-2025-04-20",
-    "Content-Type": "application/json",
+    # Required: without a claude-code User-Agent this endpoint lands in an
+    # aggressively rate-limited bucket and returns persistent 429s.
     "User-Agent": "claude-code/2.1.5",
-}
-API_BODY = {
-    "model": "claude-haiku-4-5-20251001",
-    "max_tokens": 1,
-    "messages": [{"role": "user", "content": "hi"}],
 }
 
 
@@ -296,48 +296,63 @@ async def poll_api(token: str) -> dict | None:
     headers["Authorization"] = f"Bearer {token}"
     try:
         async with httpx.AsyncClient(timeout=20.0) as http:
-            resp = await http.post(API_URL, headers=headers, json=API_BODY)
+            resp = await http.get(API_URL, headers=headers)
     except httpx.HTTPError as e:
         log(f"API call failed: {e}")
         return None
     if resp.status_code >= 400:
         log(f"API HTTP {resp.status_code}: {resp.text[:200]}")
         return None
+    try:
+        data = resp.json()
+    except ValueError:
+        log(f"API returned non-JSON body: {resp.text[:200]}")
+        return None
+    if not isinstance(data, dict):
+        log(f"API returned unexpected JSON shape: {str(data)[:200]}")
+        return None
 
-    def hdr(name: str, default: str = "0") -> str:
-        return resp.headers.get(name, default)
+    def window(name: str) -> dict:
+        w = data.get(name)
+        return w if isinstance(w, dict) else {}
 
-    now = time.time()
-
-    def reset_minutes(reset_ts: str) -> int:
+    # utilization is already a 0-100 percentage on this endpoint
+    def pct(util) -> int:
         try:
-            r = float(reset_ts)
-        except ValueError:
+            return int(round(float(util)))
+        except (TypeError, ValueError):
             return 0
-        mins = (r - now) / 60.0
-        return int(round(mins)) if mins > 0 else 0
 
-    def pct(util: str) -> int:
+    def raw(util) -> float:
+        # 0-1 fraction, matching the scale ACTIVE_THRESHOLD was tuned for
         try:
-            return int(round(float(util) * 100))
-        except ValueError:
-            return 0
-
-    def raw(util: str) -> float:
-        try:
-            return float(util)
-        except ValueError:
+            return float(util) / 100.0
+        except (TypeError, ValueError):
             return 0.0
 
+    def reset_minutes(reset_ts) -> int:
+        # resets_at is ISO 8601 with UTC offset (e.g. "2026-07-02T19:10:00+00:00")
+        try:
+            r = datetime.datetime.fromisoformat(str(reset_ts).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return 0
+        if r.tzinfo is None:
+            r = r.replace(tzinfo=datetime.timezone.utc)
+        mins = (r - datetime.datetime.now(datetime.timezone.utc)).total_seconds() / 60.0
+        return int(round(mins)) if mins > 0 else 0
+
+    five = window("five_hour")
+    seven = window("seven_day")
+    s_pct = pct(five.get("utilization"))
     payload = {
-        "s": pct(hdr("anthropic-ratelimit-unified-5h-utilization")),
-        "sr": reset_minutes(hdr("anthropic-ratelimit-unified-5h-reset")),
-        "w": pct(hdr("anthropic-ratelimit-unified-7d-utilization")),
-        "wr": reset_minutes(hdr("anthropic-ratelimit-unified-7d-reset")),
-        "st": hdr("anthropic-ratelimit-unified-5h-status", "unknown"),
+        "s": s_pct,
+        "sr": reset_minutes(five.get("resets_at")),
+        "w": pct(seven.get("utilization")),
+        "wr": reset_minutes(seven.get("resets_at")),
+        "st": "limited" if s_pct >= 100 else "allowed",
         "ok": True,
         "host": HOSTNAME,
-        "_raw_util": raw(hdr("anthropic-ratelimit-unified-5h-utilization")),
+        "_raw_util": raw(five.get("utilization")),
     }
     return payload
 
