@@ -15,7 +15,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from daemon.claude_usage_daemon_windows import AuthError, RateLimited, poll_api
+from daemon.claude_usage_daemon_windows import (
+    AuthError,
+    RateLimited,
+    _parse_retry_after,
+    poll_api,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -51,7 +56,7 @@ def _usage_body(
     }
 
 
-def _make_mock_response(status_code=200, body=None, text="mocked"):
+def _make_mock_response(status_code=200, body=None, text="mocked", headers=None):
     """Build a mock httpx.Response-like object with a controllable JSON body.
 
     body=None simulates a non-JSON response (resp.json() raises ValueError).
@@ -59,6 +64,7 @@ def _make_mock_response(status_code=200, body=None, text="mocked"):
     resp = MagicMock()
     resp.status_code = status_code
     resp.text = text
+    resp.headers = {} if headers is None else headers
     if body is None:
         resp.json = MagicMock(side_effect=ValueError("not json"))
     else:
@@ -251,6 +257,60 @@ def test_poll_api_raises_ratelimited_on_429():
     with pytest.raises(RateLimited):
         _poll_with(_make_mock_response(status_code=429))
     assert not issubclass(RateLimited, AuthError)
+
+
+def test_429_carries_retry_after_seconds():
+    """A 429 with a Retry-After header surfaces the parsed seconds on the
+    exception so the loop can honor the server's own cooldown."""
+    resp = _make_mock_response(status_code=429, headers={"retry-after": "120"})
+    with pytest.raises(RateLimited) as exc_info:
+        _poll_with(resp)
+    assert exc_info.value.retry_after == 120.0
+
+
+def test_429_without_retry_after_is_none():
+    """A 429 with no Retry-After header yields retry_after=None (loop falls
+    back to the escalating cooldown schedule)."""
+    with pytest.raises(RateLimited) as exc_info:
+        _poll_with(_make_mock_response(status_code=429))
+    assert exc_info.value.retry_after is None
+
+
+# ---------------------------------------------------------------------------
+# Test: _parse_retry_after — delta-seconds, HTTP-date, bogus values
+# ---------------------------------------------------------------------------
+
+def test_parse_retry_after_seconds():
+    assert _parse_retry_after("120") == 120.0
+    assert _parse_retry_after("1.5") == 1.5
+
+
+def test_parse_retry_after_bogus_returns_none():
+    assert _parse_retry_after(None) is None
+    assert _parse_retry_after("") is None
+    assert _parse_retry_after("garbage") is None
+    assert _parse_retry_after("-5") is None  # already elapsed
+    assert _parse_retry_after("0") is None
+
+
+def test_parse_retry_after_capped_at_one_hour():
+    """A bogus/hostile huge value must not stall polling for hours."""
+    assert _parse_retry_after("999999") == 3600.0
+
+
+def test_parse_retry_after_http_date():
+    """RFC 7231 also allows an HTTP-date form."""
+    import email.utils
+
+    future = email.utils.format_datetime(
+        datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=300)
+    )
+    parsed = _parse_retry_after(future)
+    assert parsed is not None and 290 <= parsed <= 301
+    past = email.utils.format_datetime(
+        datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=300)
+    )
+    assert _parse_retry_after(past) is None
 
 
 # ---------------------------------------------------------------------------

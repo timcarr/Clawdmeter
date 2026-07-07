@@ -8,6 +8,7 @@ later plans.
 
 import asyncio
 import datetime
+import email.utils
 import json
 import logging
 import logging.handlers
@@ -42,6 +43,9 @@ POLL_INTERVAL_ACTIVE = 45   # fast cadence: usage rose on the last poll. Measure
 RATE_LIMIT_COOLDOWN = 300   # resume fast polling this long after the LAST 429 — a 429
                             # during cooldown (on a 60s poll) re-arms it, so short is safe.
                             # Measured penalty: locked at T+3 min, clear by T+5.
+RATE_LIMIT_COOLDOWN_MAX = 900  # cap for the escalating cooldown: consecutive 429s double
+                               # the base cooldown (300 -> 600 -> 900) so a persistent
+                               # drain (whatever the cause) stops re-draining the bucket.
 TICK = 5
 SCAN_TIMEOUT = 8.0
 
@@ -124,7 +128,50 @@ class AuthError(Exception):
 class RateLimited(Exception):
     """Raised by poll_api on a 429 — the usage endpoint is rate-limiting this
     token. The poll loop reacts by holding the idle cadence (POLL_INTERVAL) for
-    RATE_LIMIT_COOLDOWN instead of retrying every tick."""
+    a cooldown instead of retrying every tick. Carries the server's Retry-After
+    (seconds) when the response included one, else None."""
+
+    def __init__(self, retry_after: float | None = None) -> None:
+        super().__init__(retry_after)
+        self.retry_after = retry_after
+
+
+def _parse_retry_after(value) -> float | None:
+    """Parse a Retry-After header value: delta-seconds or HTTP-date.
+
+    Returns positive seconds, or None when the header is absent/expired/bogus.
+    Capped at 1h so a bogus header can't stall polling for hours.
+    """
+    if not value:
+        return None
+    try:
+        secs = float(value)
+    except (TypeError, ValueError):
+        try:
+            dt = email.utils.parsedate_to_datetime(str(value))
+        except (TypeError, ValueError):
+            return None
+        if dt is None:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        secs = (dt - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+    if secs <= 0:
+        return None
+    return min(secs, 3600.0)
+
+
+def rate_limit_cooldown(strikes: int, retry_after: float | None) -> float:
+    """Cooldown after the Nth CONSECUTIVE 429 (strikes >= 1).
+
+    Honor the server's Retry-After when it sent one; otherwise escalate the
+    base cooldown (300 -> 600 -> 900 cap). The fixed 5-min re-arm let a
+    persistent drain re-drain the bucket forever (2026-07-07 field log: 17 min
+    locked out). Pure helper — unit-testable without driving the loop.
+    """
+    if retry_after is not None:
+        return retry_after
+    return float(min(RATE_LIMIT_COOLDOWN * (2 ** max(strikes - 1, 0)), RATE_LIMIT_COOLDOWN_MAX))
 
 
 def poll_interval(active: bool, now: float, rate_limited_until: float) -> float:
@@ -151,9 +198,11 @@ async def poll_api(token: str) -> dict | None:
         log(f"API HTTP {resp.status_code}: {resp.text[:200]}")
         raise AuthError(resp.status_code)
     if resp.status_code == 429:
-        # The usage endpoint has its own per-token rate limit — back off.
+        # The usage endpoint has its own per-token rate limit — back off,
+        # honoring the server's Retry-After if it sent one.
+        retry_after = _parse_retry_after(resp.headers.get("retry-after"))
         log(f"API HTTP 429 (rate limited): {resp.text[:200]}")
-        raise RateLimited()
+        raise RateLimited(retry_after)
     if resp.status_code >= 400:
         # Other 4xx/5xx (server error etc.) — transient, not a token issue.
         log(f"API HTTP {resp.status_code}: {resp.text[:200]}")
@@ -329,12 +378,13 @@ def read_token() -> str | None:
     return None
 
 
-def _read_expiry() -> str:
-    """Return human-readable expiry from the first-hit credentials file.
+def _read_expiry_ts() -> float | None:
+    """Return claudeAiOauth.expiresAt from the first-hit credentials file as
+    epoch SECONDS, or None when unknown.
 
-    Reads claudeAiOauth.expiresAt (epoch milliseconds — JS convention).
-    Divides by 1000 before passing to fromtimestamp (Python expects seconds).
-    Returns 'expiry unknown' on any parse failure.
+    CRITICAL: expiresAt is JS-convention epoch milliseconds; divide by 1000
+    (Python expects seconds — raw value -> year ~57000). Feeds both the
+    human-readable expiry string and the poll loop's pre-flight expiry check.
     """
     for path in _windows_credential_candidates():
         try:
@@ -343,19 +393,25 @@ def _read_expiry() -> str:
             continue
         try:
             data = json.loads(raw)
-            oauth = data.get("claudeAiOauth", {})
-            expires_ms = oauth.get("expiresAt")
+            expires_ms = data.get("claudeAiOauth", {}).get("expiresAt")
             if expires_ms is None:
-                return "expiry unknown"
-            # CRITICAL: expiresAt is JS-convention epoch milliseconds; divide by 1000
-            # before fromtimestamp (Python expects seconds). Raw value -> year ~57000.
-            dt = datetime.datetime.fromtimestamp(
-                expires_ms / 1000, tz=datetime.timezone.utc
-            )
-            return dt.strftime("%Y-%m-%d %H:%M UTC")
+                return None
+            return float(expires_ms) / 1000.0
         except (TypeError, ValueError, OSError, AttributeError, json.JSONDecodeError):
-            return "expiry unknown"
-    return "expiry unknown"
+            return None
+    return None
+
+
+def _read_expiry() -> str:
+    """Human-readable claudeAiOauth.expiresAt, or 'expiry unknown'."""
+    ts = _read_expiry_ts()
+    if ts is None:
+        return "expiry unknown"
+    try:
+        dt = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return "expiry unknown"
+    return dt.strftime("%Y-%m-%d %H:%M UTC")
 
 
 async def _wait_first(*events: asyncio.Event, timeout: float) -> None:
@@ -430,6 +486,9 @@ async def connect_and_run(device, stop_event: asyncio.Event, tray_state=None) ->
     last_raw_util = -1.0
     active = False             # last poll's verdict — picks the cadence below
     rate_limited_until = 0.0   # 429 backoff: hold the idle cadence until then
+    rate_limit_strikes = 0     # consecutive 429s — escalates the cooldown
+    last_good_payload = None   # last successful wire payload — resent with ok:false
+                               # so the device shows "stale" during 401/429 stretches
     used_successfully = False
     consecutive_failures = 0  # D-03: zombie-link break counter
     try:
@@ -440,51 +499,95 @@ async def connect_and_run(device, stop_event: asyncio.Event, tray_state=None) ->
             if session.refresh_requested.is_set() or elapsed >= interval:
                 session.refresh_requested.clear()
                 token = read_token()  # D-09: fresh each cycle
+                payload = None
+                degraded = False  # auth/429: mark the device's data stale below
+                expiry_ts = _read_expiry_ts()
                 if not token:
                     log("No token; skipping poll")
                     if tray_state:
                         tray_state.set_error("token expired — run claude login")
+                elif expiry_ts is not None and time.time() >= expiry_ts:
+                    # Pre-flight: the credentials file says the token is already
+                    # expired — polling is a guaranteed 401 that still burns a
+                    # request from the endpoint's rate-limit bucket. Skip the
+                    # network; read_token()/expiry re-read the file each cycle,
+                    # so recovery is automatic once the token is refreshed.
+                    log(
+                        f"Token expired ({_read_expiry()}); skipping poll — "
+                        "open Claude Code in VSCode (or run `claude login`) to re-auth"
+                    )
+                    if tray_state:
+                        tray_state.set_error("token expired — run claude login")
+                    last_poll = time.time()  # re-check at the idle cadence, not every tick
+                    degraded = True
                 else:
                     try:
                         payload = await poll_api(token)
                     except AuthError:
-                        # Real 401/403 — token genuinely needs a refresh.
+                        # Real 401/403 — the token needs a refresh. Count this as a
+                        # full interval: an expired token won't fix itself in one
+                        # TICK, and retrying at 5s is what drained the endpoint's
+                        # rate-limit bucket (2026-07-07 field log: 401 bursts ->
+                        # 429 lockout cycle).
+                        log(
+                            "Auth rejected; retrying at idle cadence — "
+                            "open Claude Code in VSCode (or run `claude login`) to re-auth"
+                        )
                         if tray_state:
                             tray_state.set_error("token expired — run claude login")
-                        payload = None
-                    except RateLimited:
+                        last_poll = time.time()
+                        degraded = True
+                    except RateLimited as e:
                         # Back off to the idle cadence and don't re-attempt every
-                        # tick (a failed poll normally retries at TICK) — count
-                        # this attempt as a full interval.
-                        rate_limited_until = time.time() + RATE_LIMIT_COOLDOWN
+                        # tick — count this attempt as a full interval. Honor
+                        # Retry-After when sent; escalate on consecutive 429s.
+                        rate_limit_strikes += 1
+                        cooldown = rate_limit_cooldown(rate_limit_strikes, e.retry_after)
+                        rate_limited_until = time.time() + cooldown
                         active = False
                         last_poll = time.time()
-                        log(f"Holding {POLL_INTERVAL}s cadence for {RATE_LIMIT_COOLDOWN // 60} min")
-                        payload = None
-                    if payload is not None:
-                        raw_util = payload.pop("_raw_util", 0.0)
-                        active = (last_raw_util >= 0 and raw_util - last_raw_util > ACTIVE_THRESHOLD)
-                        last_raw_util = raw_util
-                        payload["active"] = active
-                        if await session.write_payload(payload):
-                            last_poll = time.time()
-                            used_successfully = True
-                            consecutive_failures = 0  # D-03: reset on success
-                            if tray_state:
-                                tray_state.set_connected(time.time())
-                        else:
-                            consecutive_failures += 1
-                            if consecutive_failures >= ZOMBIE_BREAK_LIMIT:
-                                log(
-                                    f"Zombie link detected ({consecutive_failures} consecutive"
-                                    f" write failures); abandoning connection"
-                                )
-                                break
-                    # else: payload is None from a TRANSIENT failure (network/DNS,
-                    # timeout, rate-limit, 5xx). poll_api already logged it; do NOT
-                    # toast "token expired" — that mislabeled a boot-time DNS blip
-                    # as an auth problem (SC#5). Leave tray state unchanged; the next
-                    # tick retries and set_connected() recovers it.
+                        src = ("Retry-After" if e.retry_after is not None
+                               else f"429 strike {rate_limit_strikes}")
+                        log(f"Holding {POLL_INTERVAL}s cadence for {int(cooldown)}s ({src})")
+                        degraded = True
+
+                to_send = None
+                if payload is not None:
+                    rate_limit_strikes = 0
+                    raw_util = payload.pop("_raw_util", 0.0)
+                    active = (last_raw_util >= 0 and raw_util - last_raw_util > ACTIVE_THRESHOLD)
+                    last_raw_util = raw_util
+                    payload["active"] = active
+                    last_good_payload = dict(payload)
+                    to_send = payload
+                elif degraded and last_good_payload is not None:
+                    # Auth/429: tell the device its numbers are stale (ok:false,
+                    # last-known values) instead of leaving it silently frozen on
+                    # old data for the whole outage.
+                    to_send = {**last_good_payload, "ok": False, "active": False}
+
+                if to_send is not None:
+                    if await session.write_payload(to_send):
+                        last_poll = time.time()
+                        used_successfully = True
+                        consecutive_failures = 0  # D-03: reset on success
+                        # Only a GOOD payload clears the tray state — a stale
+                        # marker delivered fine must not hide the error toast.
+                        if payload is not None and tray_state:
+                            tray_state.set_connected(time.time())
+                    else:
+                        consecutive_failures += 1
+                        if consecutive_failures >= ZOMBIE_BREAK_LIMIT:
+                            log(
+                                f"Zombie link detected ({consecutive_failures} consecutive"
+                                f" write failures); abandoning connection"
+                            )
+                            break
+                # else: payload is None from a TRANSIENT failure (network/DNS,
+                # timeout, 5xx). poll_api already logged it; do NOT toast "token
+                # expired" — that mislabeled a boot-time DNS blip as an auth
+                # problem (SC#5). Leave tray state unchanged; the next tick
+                # retries and set_connected() recovers it.
 
             # Wake on a refresh request OR a stop, whichever comes first. Waking
             # promptly on stop_event is what lets the finally below run

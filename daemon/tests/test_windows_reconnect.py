@@ -22,6 +22,15 @@ from daemon.claude_usage_daemon_windows import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _expiry_unknown(monkeypatch):
+    """connect_and_run pre-flights token expiry via _read_expiry_ts(), which reads
+    the REAL credentials file — patch it to 'unknown' so loop tests stay hermetic
+    (an expired token on the dev box must not skip the mocked poll_api)."""
+    import daemon.claude_usage_daemon_windows as mod
+    monkeypatch.setattr(mod, "_read_expiry_ts", lambda: None)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

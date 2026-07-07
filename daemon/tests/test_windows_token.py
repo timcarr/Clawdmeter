@@ -10,7 +10,13 @@ from pathlib import Path
 
 import pytest
 
-from daemon.claude_usage_daemon_windows import _extract_access_token, read_token, _windows_credential_candidates, _read_expiry
+from daemon.claude_usage_daemon_windows import (
+    _extract_access_token,
+    _read_expiry,
+    _read_expiry_ts,
+    _windows_credential_candidates,
+    read_token,
+)
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -108,6 +114,28 @@ def test_read_expiry_decodes_milliseconds(monkeypatch):
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     result = _read_expiry()
     assert result.startswith("2286-"), f"Expected year 2286, got: {result}"
+
+
+def test_read_expiry_ts_epoch_seconds(monkeypatch):
+    """_read_expiry_ts() returns expiresAt as epoch SECONDS (ms / 1000) — this
+    feeds the poll loop's pre-flight check that skips guaranteed-401 polls."""
+    monkeypatch.setenv("CLAUDE_CREDENTIALS_PATH", str(FIXTURES / "credentials_nested.json"))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    assert _read_expiry_ts() == 9999999999.0
+
+
+def test_read_expiry_ts_unknown_when_no_claudeaioauth(monkeypatch):
+    """No claudeAiOauth wrapper (legacy direct shape) -> None (expiry unknown,
+    the pre-flight check must NOT block polling)."""
+    monkeypatch.setenv("CLAUDE_CREDENTIALS_PATH", str(FIXTURES / "credentials_direct.json"))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    assert _read_expiry_ts() is None
+
+
+def test_read_expiry_ts_unknown_when_file_missing(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CREDENTIALS_PATH", str(tmp_path / "nope.json"))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    assert _read_expiry_ts() is None
 
 
 # --- WR-03: regression guard for CR-01 (empty/blank token must not be accepted) ---

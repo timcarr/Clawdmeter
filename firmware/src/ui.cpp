@@ -147,6 +147,7 @@ static uint8_t anim_phase = 0;
 static uint8_t anim_msg_idx = 0;
 static uint32_t anim_msg_start = 0;
 static bool s_active = false;
+static bool s_data_ok = true;   // false: daemon marked the data stale (auth/rate-limit outage)
 static uint32_t last_update_ms = 0;
 static bool has_received_update = false;
 #define ANIM_MSG_MS     4000
@@ -448,10 +449,16 @@ void ui_init(void) {
 void ui_update(const UsageData* data) {
     if (!data->valid) return;
     s_active = data->active;
-    last_update_ms = lv_tick_get();
-    has_received_update = true;
-    last_data_ms = last_update_ms;
+    s_data_ok = data->ok;
+    last_data_ms = lv_tick_get();
     data_received = true;
+    if (data->ok) {
+        // Only good data advances the age readout: during an outage the daemon
+        // resends last-known values with ok:false, and the STALE line should
+        // show time since the numbers were real, not since the last resend.
+        last_update_ms = last_data_ms;
+        has_received_update = true;
+    }
 
     int s_pct = (int)(data->session_pct + 0.5f);
 
@@ -533,6 +540,9 @@ void ui_tick_anim(void) {
     } else if (now - connected_at_ms < 5000) {
         snprintf(buf, sizeof(buf), "%s Connected\xE2\x80\xA6",
                  spinner_frames[anim_spinner_idx]);
+    } else if (!s_data_ok) {
+        snprintf(buf, sizeof(buf), "%s STALE  %lus",
+                 spinner_frames[anim_spinner_idx], (unsigned long)secs);
     } else if (!s_active) {
         snprintf(buf, sizeof(buf), "%s IDLE  %lus",
                  spinner_frames[anim_spinner_idx], (unsigned long)secs);
@@ -593,6 +603,7 @@ void ui_update_ble_status(ble_state_t state, const char* name, const char* mac) 
     s_ble_connected = (state == BLE_STATE_CONNECTED);
     if (!s_ble_connected && was_connected) {
         s_active = false;
+        s_data_ok = true;  // next session starts clean — no leftover STALE banner
         lv_label_set_text(lbl_host, "");
     }
     if (s_ble_connected && !was_connected) {
